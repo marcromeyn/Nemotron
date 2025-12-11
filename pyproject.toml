@@ -2,7 +2,6 @@
 name = "nemotron"
 version = "0.1.0"
 description = "Reproducible training recipes for NVIDIA Nemotron model family - transparent pipelines for data preparation, training, and evaluation across all stages"
-readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
@@ -35,6 +34,7 @@ dependencies = [
     "huggingface_hub>=0.20.0",
     "pyyaml>=6.0",
     "tomli>=2.0.0;python_version<'3.11'",
+    "tomlkit>=0.12.0",
     "colorama>=0.4.6",
     "wandb>=0.23.1",
 ]
@@ -104,4 +104,7 @@ package = true
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+]
+run = [
+    "nemo-run>=0.4.0",
 ]

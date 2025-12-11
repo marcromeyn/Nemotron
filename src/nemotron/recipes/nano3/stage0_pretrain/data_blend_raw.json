@@ -120,30 +120,9 @@
       "weight": 1.0
     },
     {
-      "name": "nemotron-pretraining-code-sft",
-      "path": "hf://nvidia/Nemotron-Pretraining-Specialized-v1",
-      "subset": "Nemotron-Pretraining-Code-SFT",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-pretraining-dqa",
-      "path": "hf://nvidia/Nemotron-Pretraining-Specialized-v1",
-      "subset": "Nemotron-Pretraining-DQA",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
       "name": "nemotron-pretraining-infinibyte-reasoning",
       "path": "hf://nvidia/Nemotron-Pretraining-Specialized-v1",
       "subset": "Nemotron-Pretraining-InfiniByte-Reasoning",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-pretraining-math-sft",
-      "path": "hf://nvidia/Nemotron-Pretraining-Specialized-v1",
-      "subset": "Nemotron-Pretraining-Math-SFT",
       "text_field": "text",
       "weight": 1.0
     },
@@ -183,23 +162,37 @@
       "weight": 1.0
     },
     {
-      "name": "nemotron-sft-general",
-      "path": "hf://nvidia/Nemotron-Pretraining-SFT-v1",
-      "subset": "Nemotron-SFT-General",
+      "name": "nemotron-code-v2-synthetic-code-review",
+      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
+      "subset": "Synthetic-Code/synthetic-code-review",
       "text_field": "text",
       "weight": 1.0
     },
     {
-      "name": "nemotron-sft-code",
-      "path": "hf://nvidia/Nemotron-Pretraining-SFT-v1",
-      "subset": "Nemotron-SFT-Code",
+      "name": "nemotron-code-v2-synthetic-question-answering",
+      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
+      "subset": "Synthetic-Code/synthetic-question-answering",
       "text_field": "text",
       "weight": 1.0
     },
     {
-      "name": "nemotron-sft-math",
-      "path": "hf://nvidia/Nemotron-Pretraining-SFT-v1",
-      "subset": "Nemotron-SFT-MATH",
+      "name": "nemotron-code-v2-synthetic-rewriting",
+      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
+      "subset": "Synthetic-Code/synthetic-rewriting",
+      "text_field": "text",
+      "weight": 1.0
+    },
+    {
+      "name": "nemotron-code-v2-synthetic-student-teacher",
+      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
+      "subset": "Synthetic-Code/synthetic-student-teacher",
+      "text_field": "text",
+      "weight": 1.0
+    },
+    {
+      "name": "nemotron-code-v2-synthetic-transpilation",
+      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
+      "subset": "Synthetic-Code/synthetic-transpilation",
       "text_field": "text",
       "weight": 1.0
     }

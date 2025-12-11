@@ -36,6 +36,9 @@ from nemotron.kit.wandb import add_wandb_tags, finish_wandb
 
 STAGE_PATH = Path(__file__).parent
 
+# Module-level flag for Ray execution (used by nemotron CLI)
+RAY = True
+
 
 @dataclass
 class RLDataPrepConfig:

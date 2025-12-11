@@ -60,6 +60,10 @@ class RunConfig:
         partition: Slurm partition name
         time: Slurm job time limit (HH:MM:SS)
         job_name: Slurm job name
+        ntasks_per_node: Slurm tasks per node
+        gpus_per_node: Slurm GPUs per node
+        mem: Slurm memory request (e.g., '0' for all, '64G')
+        exclusive: Request exclusive node access
 
         tunnel: Tunnel type for Slurm (local or ssh)
         host: SSH host for remote job submission
@@ -97,8 +101,8 @@ class RunConfig:
     executor: Executor = "local"
 
     # Common resource settings
-    nproc_per_node: int = 8
-    nodes: int = 1
+    nproc_per_node: int | None = None
+    nodes: int | None = None
 
     # Container settings (docker, slurm, skypilot)
     container_image: str | None = None
@@ -109,6 +113,10 @@ class RunConfig:
     partition: str | None = None
     time: str = "04:00:00"
     job_name: str = "nemo-run"
+    ntasks_per_node: int | None = None
+    gpus_per_node: int | None = None
+    mem: str | None = None
+    exclusive: bool | None = None
 
     # SSH tunnel settings (for remote Slurm submission)
     tunnel: Literal["local", "ssh"] = "local"
@@ -182,6 +190,30 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
     if env_vars:
         merged_env.update(env_vars)
 
+    # Auto-detect HuggingFace token if not already set
+    if "HF_TOKEN" not in merged_env:
+        try:
+            from huggingface_hub import HfFolder
+
+            token = HfFolder.get_token()
+            if token:
+                merged_env["HF_TOKEN"] = token
+                sys.stderr.write("[info] Detected HuggingFace login, adding HF_TOKEN to environment\n")
+        except Exception:
+            pass  # huggingface_hub not installed or no token
+
+    # Auto-detect Weights & Biases API key if not already set
+    if "WANDB_API_KEY" not in merged_env:
+        try:
+            import wandb
+
+            api_key = wandb.api.api_key
+            if api_key:
+                merged_env["WANDB_API_KEY"] = api_key
+                sys.stderr.write("[info] Detected W&B login, adding WANDB_API_KEY to environment\n")
+        except Exception:
+            pass  # wandb not installed or not logged in
+
     match config.executor:
         case "local":
             return run.LocalExecutor(
@@ -210,18 +242,21 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
                 raise ValueError("partition required for slurm executor")
 
             tunnel = _build_tunnel(config)
+            packager = _build_packager()
+
             return run.SlurmExecutor(
                 account=config.account,
                 partition=config.partition,
                 nodes=config.nodes,
-                ntasks_per_node=config.nproc_per_node,
-                gpus_per_node=config.nproc_per_node,
+                ntasks_per_node=config.ntasks_per_node,
+                gpus_per_node=config.gpus_per_node,
                 time=config.time,
-                mem="0",
-                exclusive=True,
+                mem=config.mem,
+                exclusive=config.exclusive,
                 container_image=config.container_image,
                 container_mounts=config.mounts,
                 tunnel=tunnel,
+                packager=packager,
                 env_vars=merged_env,
             )
 
@@ -282,6 +317,49 @@ def _build_tunnel(config: RunConfig) -> Any:
             identity=config.identity,
         )
     return run.LocalTunnel()
+
+
+def _build_packager() -> Any:
+    """Build a HybridPackager for selective file syncing.
+
+    Packages only the necessary files for remote cluster sync:
+    - src/ directory (the actual code)
+    - tests/ directory
+    - Top-level files: pyproject.toml, run.toml, README.md
+
+    This avoids packaging large unnecessary directories like
+    usage-cookbook/ and use-case-examples/.
+
+    Returns:
+        A HybridPackager instance configured for selective syncing.
+    """
+    from nemo_run.core.packaging import HybridPackager, PatternPackager
+
+    return HybridPackager(
+        extract_at_root=True,
+        sub_packagers={
+            "src": PatternPackager(
+                include_pattern="src",
+                relative_path=".",
+            ),
+            "tests": PatternPackager(
+                include_pattern="tests",
+                relative_path=".",
+            ),
+            "pyproject": PatternPackager(
+                include_pattern="pyproject.toml",
+                relative_path=".",
+            ),
+            "run_toml": PatternPackager(
+                include_pattern="run.toml",
+                relative_path=".",
+            ),
+            "readme": PatternPackager(
+                include_pattern="README.md",
+                relative_path=".",
+            ),
+        },
+    )
 
 
 def _find_run_config() -> Path | None:
@@ -468,6 +546,7 @@ def run_with_nemo_run(
     """
     try:
         import nemo_run as run
+        from nemo_run.run.ray.job import RayJob
     except ImportError:
         sys.stderr.write(
             "[run] ERROR: nemo-run not installed. Install with: pip install nemo-run\n"
@@ -483,17 +562,95 @@ def run_with_nemo_run(
     executor = build_executor(run_config)
 
     if ray:
+        import tempfile
+
+        import yaml
+
         # Recipe requires Ray - use RayJob
-        ray_job = run.RayJob(executor=executor)
-        cmd = f"python {script_path}"
+        # Generate job name from script path or config
+        job_name = run_config.job_name or Path(script_path).stem
+        ray_job = RayJob(name=job_name, executor=executor)
+
+        # Install uv and sync the project on each node before Ray starts
+        # This ensures the nemotron package is available to all Ray workers
+        # Use --reinstall-package to force update the local editable package
+        # and clear __pycache__ to avoid stale bytecode
+        # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
+        setup_commands = [
+            "pip install uv",
+            "find . -type d -name __pycache__ -delete 2>/dev/null || true",
+            "uv sync --reinstall-package nemotron",
+        ]
+        if pre_ray_start_commands is None:
+            pre_ray_start_commands = setup_commands
+        else:
+            # Prepend setup commands if not already present
+            for cmd in reversed(setup_commands):
+                if cmd not in pre_ray_start_commands:
+                    pre_ray_start_commands = [cmd] + pre_ray_start_commands
+
+        # Use uv run to execute script with proper project environment
+        # Prepend cache cleanup and reinstall to ensure fresh code on each job
+        # This handles the case where Ray cluster is reused across code changes
+        # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
+        cmd = (
+            "find . -type d -name __pycache__ -delete 2>/dev/null || true && "
+            "uv sync --reinstall-package nemotron && "
+            f"uv run {script_path}"
+        )
         if script_args:
             cmd += " " + " ".join(script_args)
+
+        # Build runtime_env with environment variables for Ray workers
+        # This ensures env vars like HF_TOKEN are available in Ray tasks/actors
+        runtime_env: dict = {"env_vars": {}}
+
+        # Auto-detect HuggingFace token for Ray workers
+        try:
+            from huggingface_hub import HfFolder
+
+            hf_token = HfFolder.get_token()
+            if hf_token:
+                runtime_env["env_vars"]["HF_TOKEN"] = hf_token
+        except Exception:
+            pass
+
+        # Auto-detect Weights & Biases API key for Ray workers
+        try:
+            import wandb
+
+            wandb_api_key = wandb.api.api_key
+            if wandb_api_key:
+                runtime_env["env_vars"]["WANDB_API_KEY"] = wandb_api_key
+        except Exception:
+            pass
+
+        # Create temporary runtime_env YAML file if we have env vars to pass
+        runtime_env_yaml = None
+        if runtime_env["env_vars"]:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False
+            ) as f:
+                yaml.dump(runtime_env, f)
+                runtime_env_yaml = f.name
+
         ray_job.start(
             command=cmd,
             workdir=run_config.ray_working_dir,
             pre_ray_start_commands=pre_ray_start_commands,
+            runtime_env_yaml=runtime_env_yaml,
         )
-        ray_job.logs(follow=True)
+        if not run_config.detach:
+            try:
+                ray_job.logs(follow=True)
+            except KeyboardInterrupt:
+                sys.stderr.write("\n[info] Ctrl-C detected, stopping Ray cluster...\n")
+                try:
+                    ray_job.stop()
+                    sys.stderr.write("[info] Ray cluster stopped\n")
+                except Exception as e:
+                    sys.stderr.write(f"[warning] Failed to stop Ray cluster: {e}\n")
+                raise
     else:
         # Standard execution via nemo-run Script
         with run.Experiment(run_config.job_name) as exp:

@@ -247,7 +247,7 @@ def last_mile_process(
 
         # BinIdx output (tokenization)
         config = PipelineConfig(
-            tokenizer=TokenizerConfig(model="meta-llama/Llama-3.2-1B"),
+            tokenizer=TokenizerConfig(model="nvidia/NVIDIA-Nemotron-Nano-9B-v2"),
             output=OutputConfig(dir=Path("./output")),
         )
         result = last_mile_process(blend, config)

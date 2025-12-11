@@ -16,7 +16,7 @@ Quick Start:
     config = DataPrepConfig(
         blend_path=Path("data_blend.json"),
         output_dir=Path("./output"),
-        tokenizer_model="meta-llama/Llama-3.2-1B",
+        tokenizer_model="nvidia/NVIDIA-Nemotron-Nano-9B-v2",
     )
 
     # Run data preparation
@@ -115,7 +115,7 @@ class DataPrepConfig:
     """Train:valid:test ratio (e.g., '99990,8,2') or None to disable"""
 
     # Tokenizer
-    tokenizer_model: str = "meta-llama/Llama-3.2-1B"
+    tokenizer_model: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     """HuggingFace tokenizer model name"""
 
     add_bos: bool = False

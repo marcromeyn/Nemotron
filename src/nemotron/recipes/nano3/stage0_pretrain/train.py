@@ -34,10 +34,10 @@ def main(config: ConfigContainer, data=None):
     from megatron.bridge.training.gpt_step import forward_step
     from megatron.bridge.training.pretrain import pretrain
 
-    rich.print(config)
+    # rich.print(config)
 
-    # model = pretrain(config=config, forward_step_func=forward_step)
-    # print_step_complete(data=data, model=model)
+    model = pretrain(config=config, forward_step_func=forward_step)
+    print_step_complete(data=data, model=model)
 
 
 if __name__ == "__main__":

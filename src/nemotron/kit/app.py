@@ -357,6 +357,32 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
     return run_name, run_overrides, remaining
 
 
+def _append_wandb_args(args: list[str], wandb_config: WandbConfig) -> list[str]:
+    """Append wandb CLI arguments from WandbConfig.
+
+    Args:
+        args: Existing CLI arguments
+        wandb_config: WandbConfig with project, entity, etc.
+
+    Returns:
+        New args list with wandb CLI flags appended.
+    """
+    result = list(args)
+
+    if wandb_config.project:
+        result.extend(["--wandb.project", wandb_config.project])
+    if wandb_config.entity:
+        result.extend(["--wandb.entity", wandb_config.entity])
+    if wandb_config.run_name:
+        result.extend(["--wandb.run-name", wandb_config.run_name])
+    for tag in wandb_config.tags:
+        result.extend(["--wandb.tags", tag])
+    if wandb_config.notes:
+        result.extend(["--wandb.notes", wandb_config.notes])
+
+    return result
+
+
 def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_args: list[str]) -> None:
     """Execute command via nemo-run with the specified profile.
 
@@ -365,33 +391,153 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
         overrides: Key-value overrides for the run profile
         remaining_args: Additional CLI arguments
     """
-    from nemotron.kit.run import load_run_profile, build_executor
+    from nemotron.kit.run import load_run_profile, load_wandb_config, build_executor, run_with_nemo_run
 
-    profile = load_run_profile(run_name, overrides)
-    executor = build_executor(profile)
+    # Load profile from run.toml
+    profile = load_run_profile(run_name)
 
-    # Import nemo_run and execute
-    try:
-        import nemo_run as run
-    except ImportError:
-        print("Error: nemo-run is required for --run support")
-        print("Install with: pip install nemo-run")
-        import sys
-        sys.exit(1)
+    # Load wandb config and append CLI args for remote execution
+    wandb_config = load_wandb_config()
+    if wandb_config is not None and wandb_config.enabled:
+        remaining_args = _append_wandb_args(remaining_args, wandb_config)
 
-    # Execute with nemo-run
-    # The remaining_args contain the subcommand and its arguments
-    import sys
-    script = sys.argv[0]
+    # Apply CLI overrides
+    for key, value in overrides.items():
+        if hasattr(profile, key):
+            # Handle type conversion for common types
+            field_type = type(getattr(profile, key))
+            if field_type == bool:
+                value = value.lower() in ("true", "1", "yes")
+            elif field_type == int:
+                value = int(value)
+            elif field_type == list:
+                value = value.split(",") if value else []
+            setattr(profile, key, value)
+        else:
+            raise ValueError(f"Unknown run config field: {key}")
 
-    with run.Experiment(run_name) as exp:
-        exp.add(
-            run.Script(
-                inline=f"python {script} {' '.join(remaining_args)}",
-            ),
-            executor=executor,
+    # Build descriptive experiment name from subcommand path
+    # Extract subcommand parts (stop at first flag)
+    subcommand_parts = []
+    for arg in remaining_args:
+        if arg.startswith("-"):
+            break
+        subcommand_parts.append(arg)
+    experiment_name = "-".join(subcommand_parts) if subcommand_parts else run_name
+
+    # Check if target module has RAY = True
+    use_ray = _check_module_ray_flag(subcommand_parts)
+
+    if use_ray:
+        # Use Ray execution path via run_with_nemo_run
+        # Build the command - need to include 'nano3' since it was stripped by __main__.py
+        # remaining_args is ['data', 'prep', 'pretrain', ...] but remote needs 'nano3' prefix
+        script_path = f"python -m nemotron nano3 {' '.join(remaining_args)}"
+        run_with_nemo_run(
+            script_path=script_path,
+            script_args=[],  # Args already included in script_path
+            run_config=profile,
+            ray=True,
+            pre_ray_start_commands=None,
         )
-        exp.run()
+    else:
+        # Standard execution via nemo-run Experiment
+        executor = build_executor(profile)
+
+        try:
+            import nemo_run as run
+        except ImportError:
+            print("Error: nemo-run is required for --run support")
+            print("Install with: pip install nemo-run")
+            import sys
+            sys.exit(1)
+
+        with run.Experiment(experiment_name) as exp:
+            exp.add(
+                run.Script(
+                    path="nemotron",
+                    args=remaining_args,
+                    m=True,  # Use python -m nemotron instead of local script path
+                    entrypoint="python",
+                ),
+                executor=executor,
+            )
+            exp.run(detach=profile.detach)
+
+
+def _check_module_ray_flag(subcommand_parts: list[str]) -> bool:
+    """Check if the target module has RAY = True.
+
+    Args:
+        subcommand_parts: CLI subcommand parts (e.g., ['nano3', 'data', 'prep', 'pretrain'])
+
+    Returns:
+        True if the module has RAY = True, False otherwise.
+    """
+    # Map CLI subcommands to module paths
+    # e.g., ['nano3', 'data', 'prep', 'pretrain'] -> nemotron.recipes.nano3.stage0_pretrain.data_prep
+    module_path = _subcommand_to_module(subcommand_parts)
+    if module_path is None:
+        return False
+
+    try:
+        import importlib
+        module = importlib.import_module(module_path)
+        return getattr(module, "RAY", False)
+    except (ImportError, AttributeError):
+        return False
+
+
+def _subcommand_to_module(subcommand_parts: list[str]) -> str | None:
+    """Convert CLI subcommand parts to a module path.
+
+    Args:
+        subcommand_parts: CLI subcommand parts
+
+    Returns:
+        Module path string or None if not mappable.
+    """
+    # Handle nano3 recipe subcommands
+    # Note: The 'nano3' prefix may already be consumed by __main__.py before we get here
+    # Format without nano3: data prep <stage> -> nemotron.recipes.nano3.stage<N>_<stage>.data_prep
+    # Format with nano3: nano3 data prep <stage> -> same
+
+    # Normalize: skip 'nano3' prefix if present
+    parts = subcommand_parts
+    if parts and parts[0] == "nano3":
+        parts = parts[1:]
+
+    # Now expecting: ['data', 'prep', 'pretrain'] or ['train', 'pretrain']
+    if len(parts) >= 3 and parts[0] == "data" and parts[1] == "prep":
+        stage = parts[2]  # e.g., "pretrain", "sft", "rl"
+
+        # Map stage names to directory names
+        stage_map = {
+            "pretrain": "stage0_pretrain",
+            "sft": "stage1_sft",
+            "rl": "stage2_rl",
+        }
+        stage_dir = stage_map.get(stage)
+        if stage_dir is None:
+            return None
+
+        return f"nemotron.recipes.nano3.{stage_dir}.data_prep"
+
+    elif len(parts) >= 2 and parts[0] == "train":
+        stage = parts[1]  # e.g., "pretrain", "sft", "rl"
+
+        stage_map = {
+            "pretrain": "stage0_pretrain",
+            "sft": "stage1_sft",
+            "rl": "stage2_rl",
+        }
+        stage_dir = stage_map.get(stage)
+        if stage_dir is None:
+            return None
+
+        return f"nemotron.recipes.nano3.{stage_dir}.train"
+
+    return None
 
 
 def _maybe_load_config_file(args: list[str]) -> dict[str, Any] | None:

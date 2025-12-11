@@ -33,6 +33,9 @@ from nemotron.kit.wandb import add_wandb_tags, finish_wandb
 
 STAGE_PATH = Path(__file__).parent
 
+# Module-level flag for Ray execution (used by nemotron CLI)
+RAY = True
+
 
 @dataclass
 class SFTDataPrepConfig:
@@ -49,7 +52,7 @@ class SFTDataPrepConfig:
     """Output directory for packed .npy data"""
 
     # Tokenizer
-    tokenizer_model: str = "nvidia/Nemotron-4-340B-Instruct"
+    tokenizer_model: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     """HuggingFace tokenizer model name"""
 
     # Packing
@@ -178,4 +181,4 @@ def main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
 
 
 if __name__ == "__main__":
-    cli(main)
+    cli(main, ray=True)

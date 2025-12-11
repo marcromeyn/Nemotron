@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -80,13 +81,16 @@ def fetch_hf_dataset_metadata(
         request = urllib.request.Request(url)
 
         # Try to get HuggingFace token for authentication
-        try:
-            from huggingface_hub import HfFolder
-            token = HfFolder.get_token()
-            if token:
-                request.add_header("Authorization", f"Bearer {token}")
-        except Exception:
-            pass  # No token available, try without auth
+        # Check HF_TOKEN env var first (for remote execution), then local cache
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            try:
+                from huggingface_hub import HfFolder
+                token = HfFolder.get_token()
+            except Exception:
+                pass  # huggingface_hub not installed or no token
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
 
         # Fetch metadata
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -184,7 +188,17 @@ def discover_hf_files(config: DatasetConfig) -> list[FileInfo]:
     from huggingface_hub import HfApi
 
     hf_path = config.path[5:]  # Remove hf:// prefix
-    api = HfApi()
+
+    # Get token from env var (for remote execution) or local cache
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        try:
+            from huggingface_hub import HfFolder
+            token = HfFolder.get_token()
+        except Exception:
+            pass  # No token available
+
+    api = HfApi(token=token)
 
     # Resolve revision to SHA for determinism
     dataset_info = api.dataset_info(hf_path, revision=config.revision)

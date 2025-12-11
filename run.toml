@@ -5,3 +5,47 @@ entity = "romeyn"
 [local]
 executor = "local"
 nproc_per_node = 8
+
+[dlw]
+executor = "slurm"
+account = "coreai_dlalgo_llm"
+partition = "batch"
+time = "04:00:00"
+tunnel = "ssh"
+host = "dlw"
+user = "mromeijn"
+remote_job_dir = "/lustre/fsw/portfolios/coreai/users/mromeijn/run"
+
+[prep]
+extends = "dlw"
+# Uses batch partition with 1 GPU - CPU nodes don't have nvidia-container-cli
+nodes = 1
+ntasks_per_node = 1
+gpus_per_node = 1
+container_image = "/lustre/fsw/portfolios/coreai/users/mromeijn/run/ray.sqsh"
+
+[megatron]
+extends = "dlw"
+nodes = 1
+ntasks_per_node = 8
+gpus_per_node = 8
+mem = "0"
+exclusive = true
+container_image = "/lustre/fsw/portfolios/coreai/users/mromeijn/run/nano3-nemo-25.11.sqsh"
+
+[rl]
+extends = "dlw"
+nodes = 1
+ntasks_per_node = 8
+gpus_per_node = 8
+mem = "0"
+exclusive = true
+container_image = "/lustre/fsw/portfolios/coreai/users/mromeijn/run/nano3-rl-25.11.sqsh"
+
+[megatron-raw]
+extends = "dlw"
+container_image = "nvcr.io/nvidian/nemo:25.11-nano-v3.rc1"
+
+[rl-raw]
+extends = "dlw"
+container_image = "nvcr.io/nvidian/nemo-rl:25.11-nano-v3.rc0"

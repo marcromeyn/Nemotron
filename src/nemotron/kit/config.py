@@ -13,7 +13,7 @@ import json
 import sys
 from dataclasses import field, fields, is_dataclass, make_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Type, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Callable, Generic, Type, TypeVar, overload
 
 if TYPE_CHECKING:
     from nemotron.kit.wandb import WandbConfig
@@ -38,7 +38,7 @@ T = TypeVar("T")
 CONFIG_FILE_KEYS = {"--config-file", "--config_file", "--config"}
 
 
-class ConfigManager[T]:
+class ConfigManager(Generic[T]):
     """
     Parses, merges, and validates configuration from files and CLI.
 

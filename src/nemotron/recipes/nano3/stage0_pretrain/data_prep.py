@@ -15,6 +15,9 @@ from nemotron.kit.wandb import add_wandb_tags
 
 STAGE_PATH = Path(__file__).parent
 
+# Module-level flag for Ray execution (used by nemotron CLI)
+RAY = True
+
 
 @dataclass
 class PreTrainDataPrepConfig:
@@ -35,7 +38,7 @@ class PreTrainDataPrepConfig:
     split: str | None = "99990,8,2"
     """Train:valid:test ratio (e.g., '99990,8,2') or None to disable"""
 
-    tokenizer_model: str = "meta-llama/Llama-3.2-1B"
+    tokenizer_model: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     """HuggingFace tokenizer model name"""
 
     add_bos: bool = False
@@ -97,4 +100,4 @@ def main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
 
 
 if __name__ == "__main__":
-    cli(main)
+    cli(main, ray=True)
