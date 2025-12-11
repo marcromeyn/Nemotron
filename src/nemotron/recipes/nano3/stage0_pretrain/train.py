@@ -16,6 +16,10 @@ Usage:
     # With mock data for testing
     torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
         --config.data.mock
+
+    # With kwargs_schema CLI args (e.g., --fn.seq-length, --fn.mock)
+    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
+        --fn.seq-length 4096 --fn.mock
 """
 
 from __future__ import annotations
@@ -41,11 +45,25 @@ def main(config: ConfigContainer, data=None):
 
 
 if __name__ == "__main__":
+    # This requires: https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/liding/nm6_one_off
+    # Part of: nvcr.io/nvidian/nemo:25.11-nano-v3.rc1
     from megatron.bridge.training.config import ConfigContainer
-    from megatron.bridge.recipes.nemotronh.nemotron_nano_v2 import nemotron_nano_v2
+
+    try:
+        from megatron.bridge.recipes.nemotronh.nemotron_next_3b_v2 import (
+            nemotron_next_3b_v2_pretrain_config as nano_3_pretrain_config,
+            NemotronNext3Bv2CommonKwargs,
+        )
+    except ImportError:
+        # Fallback to stub when megatron-bridge isn't available
+        from nemotron.recipes.nano3.stage0_pretrain.train_kwargs_stub import (
+            NemotronNext3Bv2CommonKwargs,
+        )
+        nano_3_pretrain_config = None
 
     cli(
         main,
-        defaults=nemotron_nano_v2,
-        parse_inputs={"data.blend_path": "config.data.data_path"},
+        defaults_fn=nano_3_pretrain_config,
+        kwargs_schema=NemotronNext3Bv2CommonKwargs,
+        parse_inputs={"data.blend_path": "fn.per_split_data_args_path"},
     )

@@ -91,6 +91,8 @@ class RunConfig:
         nemo_run_dir: Lepton nemo-run directory
 
         ray_working_dir: Working directory for Ray jobs
+        ray_mode: Ray execution mode - "job" (ephemeral, auto-terminates) or
+            "cluster" (persistent, for interactive use)
 
         env_vars: Environment variables (KEY=VALUE format)
         dry_run: Print commands without executing
@@ -150,6 +152,7 @@ class RunConfig:
 
     # Ray infrastructure settings (used when recipe has ray=True)
     ray_working_dir: str | None = None
+    ray_mode: Literal["job", "cluster"] = "job"  # "job" (ephemeral) or "cluster" (persistent)
 
     # Environment
     env_vars: list[str] = field(default_factory=list)
@@ -213,6 +216,19 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
                 sys.stderr.write("[info] Detected W&B login, adding WANDB_API_KEY to environment\n")
         except Exception:
             pass  # wandb not installed or not logged in
+
+    # Add PYTHONPATH for src-layout packages
+    # nemo-run sets workdir to /nemo_run/code, but src-layout needs /nemo_run/code/src
+    # Use ${PYTHONPATH:-} to avoid 'unbound variable' error when PYTHONPATH is not set
+    # (nemo-run's sbatch uses 'set -u')
+    if "PYTHONPATH" not in merged_env:
+        merged_env["PYTHONPATH"] = "/nemo_run/code/src:${PYTHONPATH:-}"
+    else:
+        merged_env["PYTHONPATH"] = f"/nemo_run/code/src:{merged_env['PYTHONPATH']}"
+
+    # Set NEMO_RUN_DIR to experiment root for output paths
+    # Container workdir is /nemo_run/code, but outputs should go to /nemo_run
+    merged_env.setdefault("NEMO_RUN_DIR", "/nemo_run")
 
     match config.executor:
         case "local":
@@ -323,12 +339,13 @@ def _build_packager() -> Any:
     """Build a HybridPackager for selective file syncing.
 
     Packages only the necessary files for remote cluster sync:
-    - src/ directory (the actual code)
-    - tests/ directory
+    - src/ directory: only .py, .json, .jinja, .typed files (excludes __pycache__)
+    - tests/ directory: only .py files
     - Top-level files: pyproject.toml, run.toml, README.md
 
-    This avoids packaging large unnecessary directories like
-    usage-cookbook/ and use-case-examples/.
+    This avoids packaging:
+    - __pycache__/ directories with stale .pyc bytecode
+    - Large unnecessary directories like usage-cookbook/
 
     Returns:
         A HybridPackager instance configured for selective syncing.
@@ -338,12 +355,26 @@ def _build_packager() -> Any:
     return HybridPackager(
         extract_at_root=True,
         sub_packagers={
-            "src": PatternPackager(
-                include_pattern="src",
+            # Package src/ with only source files, excluding __pycache__
+            "src_py": PatternPackager(
+                include_pattern='src -name "*.py"',
                 relative_path=".",
             ),
+            "src_json": PatternPackager(
+                include_pattern='src -name "*.json"',
+                relative_path=".",
+            ),
+            "src_jinja": PatternPackager(
+                include_pattern='src -name "*.jinja"',
+                relative_path=".",
+            ),
+            "src_typed": PatternPackager(
+                include_pattern='src -name "py.typed"',
+                relative_path=".",
+            ),
+            # Package tests/ with only .py files
             "tests": PatternPackager(
-                include_pattern="tests",
+                include_pattern='tests -name "*.py"',
                 relative_path=".",
             ),
             "pyproject": PatternPackager(
@@ -546,6 +577,7 @@ def run_with_nemo_run(
     """
     try:
         import nemo_run as run
+        from nemo_run.run.ray.cluster import RayCluster
         from nemo_run.run.ray.job import RayJob
     except ImportError:
         sys.stderr.write(
@@ -571,16 +603,31 @@ def run_with_nemo_run(
         job_name = run_config.job_name or Path(script_path).stem
         ray_job = RayJob(name=job_name, executor=executor)
 
-        # Install uv and sync the project on each node before Ray starts
-        # This ensures the nemotron package is available to all Ray workers
+        # Log the ray mode
+        mode_desc = "ephemeral" if run_config.ray_mode == "job" else "persistent"
+        sys.stderr.write(f"[run] Ray mode: {run_config.ray_mode} ({mode_desc} cluster)\n")
+
+        # Build log clearing command to prevent old logs from appearing in output.
+        # nemo-run reuses Ray clusters and appends to existing log files, so we
+        # truncate the log file before starting to ensure clean output.
+        log_clear_cmd = None
+        if run_config.remote_job_dir:
+            log_file = f"{run_config.remote_job_dir}/{job_name}/logs/ray-job.log"
+            log_clear_cmd = f": > {log_file} 2>/dev/null || true"
+
+        # Sync the project on each node before Ray starts
+        # This ensures Ray and the nemotron package are available to all workers
         # Use --reinstall-package to force update the local editable package
         # and clear __pycache__ to avoid stale bytecode
         # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
+        # Note: uv is already available in the container image
         setup_commands = [
-            "pip install uv",
             "find . -type d -name __pycache__ -delete 2>/dev/null || true",
             "uv sync --reinstall-package nemotron",
         ]
+        # Prepend log clearing if remote_job_dir is configured
+        if log_clear_cmd:
+            setup_commands.insert(0, log_clear_cmd)
         if pre_ray_start_commands is None:
             pre_ray_start_commands = setup_commands
         else:
@@ -642,14 +689,42 @@ def run_with_nemo_run(
         )
         if not run_config.detach:
             try:
-                ray_job.logs(follow=True)
+                # Workaround for nemo-run bug: when reusing an existing cluster,
+                # SlurmRayCluster.create() returns None instead of the job_id.
+                # The logs() method then fails because job_ids.json may not exist yet.
+                # Retry a few times to give the cluster time to write job_ids.json.
+                import time
+
+                max_retries = 6
+                retry_delay = 5
+                for attempt in range(max_retries):
+                    try:
+                        ray_job.logs(follow=True)
+                        break
+                    except RuntimeError as e:
+                        if "has no job_id" in str(e) and attempt < max_retries - 1:
+                            sys.stderr.write(
+                                f"[info] Waiting for job_id to become available "
+                                f"(attempt {attempt + 1}/{max_retries})...\n"
+                            )
+                            time.sleep(retry_delay)
+                        else:
+                            raise
             except KeyboardInterrupt:
-                sys.stderr.write("\n[info] Ctrl-C detected, stopping Ray cluster...\n")
-                try:
-                    ray_job.stop()
-                    sys.stderr.write("[info] Ray cluster stopped\n")
-                except Exception as e:
-                    sys.stderr.write(f"[warning] Failed to stop Ray cluster: {e}\n")
+                if run_config.ray_mode == "cluster":
+                    # In cluster mode, keep the cluster running for subsequent jobs
+                    sys.stderr.write(
+                        "\n[info] Ctrl-C detected. Cluster mode: leaving Ray cluster running.\n"
+                        "[info] Use 'scancel <job_id>' to stop the cluster manually.\n"
+                    )
+                else:
+                    # In job mode, stop the cluster
+                    sys.stderr.write("\n[info] Ctrl-C detected, stopping Ray cluster...\n")
+                    try:
+                        ray_job.stop()
+                        sys.stderr.write("[info] Ray cluster stopped\n")
+                    except Exception as e:
+                        sys.stderr.write(f"[warning] Failed to stop Ray cluster: {e}\n")
                 raise
     else:
         # Standard execution via nemo-run Script

@@ -209,6 +209,24 @@ class OutputConfig:
 
 
 @dataclass(frozen=True)
+class PerSplitConfig:
+    """Configuration for per-split output mode.
+
+    Distributes shards into train/valid/test splits and outputs JSON
+    with {"train": [...], "valid": [...], "test": [...]} keys.
+
+    Attributes:
+        enabled: If True, enables per-split output mode
+        valid_shards: Number of shards for validation (default: 1)
+        test_shards: Number of shards for test (default: 1)
+    """
+
+    enabled: bool = True
+    valid_shards: int = 1
+    test_shards: int = 1
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """Complete pipeline configuration.
 
@@ -219,7 +237,8 @@ class PipelineConfig:
         sample: Shard sampling spec ("10%", "5", or None for all)
         sample_seed: Random seed for sampling
         force: Force new run (ignore cached results)
-        split: Split ratio for single-blend mode (e.g., "99990,8,2")
+        split: Split ratio for single-blend mode (e.g., "99990,8,2"). Deprecated in favor of per_split.
+        per_split: Per-split output configuration for Megatron-Bridge per_split_data_args_path
     """
 
     output: OutputConfig
@@ -228,7 +247,8 @@ class PipelineConfig:
     sample: str | int | None = None
     sample_seed: int = 42
     force: bool = False
-    split: str | None = None  # Only used in single-blend mode
+    split: str | None = None  # Deprecated - use per_split instead
+    per_split: PerSplitConfig | None = None
 
 
 # ============================================================================

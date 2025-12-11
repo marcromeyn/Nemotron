@@ -18,6 +18,7 @@ from nemotron.data_prep.config import (
     InternalOutputConfig,
     InternalTokenizerConfig,
     PipelineConfig,
+    PerSplitConfig,
     ShardPlan,
     SourceChangedError,
     TokenizerConfig,
@@ -322,19 +323,38 @@ def tokenize(
 
 
 def _tokenize_single(blend: DataBlend, config: PipelineConfig) -> PipelineResult:
-    """Process single blend (Megatron-Bridge splits by ratio at training)."""
+    """Process single blend.
+
+    If config.per_split is set, distributes shards into train/valid/test splits
+    and outputs {"train": [...], "valid": [...], "test": [...]} JSON format
+    compatible with Megatron-Bridge's per_split_data_args_path parameter.
+
+    Otherwise, outputs {"data_paths": [...], "split": "..."} format for
+    runtime split by ratio.
+    """
     split_result = _process_split(
         datasets=blend.datasets,
         split_name="all",
         config=config,
     )
 
-    # Generate blend.json with data_paths and optional split ratio
-    blend_data: dict = {
-        "data_paths": split_result.data_paths,
-    }
-    if config.split:
-        blend_data["split"] = config.split
+    # Check if per-split output mode is enabled
+    if config.per_split is not None and config.per_split.enabled:
+        blend_data = _distribute_shards_to_splits(
+            data_paths=split_result.data_paths,
+            num_shards=split_result.num_shards,
+            valid_shards=config.per_split.valid_shards,
+            test_shards=config.per_split.test_shards,
+        )
+        is_per_split = True
+        split_ratio = None
+    else:
+        # Generate blend.json with data_paths and optional split ratio
+        blend_data = {"data_paths": split_result.data_paths}
+        if config.split:
+            blend_data["split"] = config.split
+        is_per_split = False
+        split_ratio = config.split
 
     blend_path = config.output.dir / "blend.json"
     _write_json(blend_path, blend_data)
@@ -343,14 +363,102 @@ def _tokenize_single(blend: DataBlend, config: PipelineConfig) -> PipelineResult
         output_dir=config.output.dir,
         blend_path=blend_path,
         splits={"all": split_result},
-        is_per_split=False,
-        split_ratio=config.split,
+        is_per_split=is_per_split,
+        split_ratio=split_ratio,
         elapsed_sec=0,
     )
 
 
+def _distribute_shards_to_splits(
+    data_paths: list[str],
+    num_shards: int,
+    valid_shards: int = 1,
+    test_shards: int = 1,
+) -> dict[str, list[str]]:
+    """Distribute shard paths into train/valid/test splits.
+
+    Assigns the last shards to validation and test, with the remainder going
+    to train. Specifically:
+    - test: last `test_shards` shard(s)
+    - valid: previous `valid_shards` shard(s)
+    - train: all remaining shards
+
+    The data_paths format is: ["weight", "path", "weight", "path", ...]
+    where paths are shard prefixes (e.g., /path/to/shard).
+
+    Output format compatible with Megatron-Bridge's per_split_data_args_path:
+    {"train": ["weight", "path_0000", "weight", "path_0001", ...], "valid": [...], "test": [...]}
+
+    Args:
+        data_paths: Megatron-Bridge format path list ["weight", "path", ...]
+        num_shards: Total number of shards per dataset
+        valid_shards: Number of shards for validation
+        test_shards: Number of shards for test
+
+    Returns:
+        Dict with "train", "valid", "test" keys containing data_paths lists
+    """
+    # Parse weight/path pairs from data_paths
+    # Format: ["1.0", "/path/dataset1/shard", "0.5", "/path/dataset2/shard", ...]
+    pairs = []
+    for i in range(0, len(data_paths), 2):
+        if i + 1 < len(data_paths):
+            weight = data_paths[i]
+            prefix = data_paths[i + 1]
+            pairs.append((weight, prefix))
+
+    # Calculate shard distribution
+    # test gets the last `test_shards` shards
+    # valid gets the previous `valid_shards` shards
+    # train gets all remaining shards
+    total_reserved = valid_shards + test_shards
+    if total_reserved >= num_shards:
+        # Not enough shards - give at least 1 to each split
+        train_end = max(1, num_shards - 2)
+        valid_start = train_end
+        valid_end = min(train_end + 1, num_shards - 1)
+        test_start = valid_end
+    else:
+        train_end = num_shards - total_reserved
+        valid_start = train_end
+        valid_end = train_end + valid_shards
+        test_start = valid_end
+
+    # Build split-specific data_paths lists
+    # Each split gets specific shard file paths (with _XXXX suffix)
+    train_paths: list[str] = []
+    valid_paths: list[str] = []
+    test_paths: list[str] = []
+
+    for weight, prefix in pairs:
+        # Train shards: 0 to train_end-1
+        for shard_idx in range(train_end):
+            train_paths.append(weight)
+            train_paths.append(f"{prefix}_{shard_idx:04d}")
+
+        # Valid shards: valid_start to valid_end-1
+        for shard_idx in range(valid_start, valid_end):
+            valid_paths.append(weight)
+            valid_paths.append(f"{prefix}_{shard_idx:04d}")
+
+        # Test shards: test_start to num_shards-1
+        for shard_idx in range(test_start, num_shards):
+            test_paths.append(weight)
+            test_paths.append(f"{prefix}_{shard_idx:04d}")
+
+    return {
+        "train": train_paths,
+        "valid": valid_paths,
+        "test": test_paths,
+    }
+
+
 def _tokenize_per_split(blend: DataBlend, config: PipelineConfig) -> PipelineResult:
-    """Process each split separately (train/valid/test)."""
+    """Process each split separately (train/valid/test).
+
+    Generates blend.json with {"train": [...], "valid": [...], "test": [...]}
+    format compatible with Megatron-Bridge's per_split_data_args_path parameter.
+    """
     splits: dict[str, SplitResult] = {}
     blend_data: dict[str, list[str]] = {}
 
@@ -381,7 +489,8 @@ def _tokenize_per_split(blend: DataBlend, config: PipelineConfig) -> PipelineRes
         )
 
         splits[split_name] = split_result
-        blend_data[f"{split_name}_data_paths"] = split_result.data_paths
+        # Use simple key names for Megatron-Bridge compatibility
+        blend_data[split_name] = split_result.data_paths
 
     # Generate combined blend.json
     blend_path = config.output.dir / "blend.json"
@@ -769,6 +878,11 @@ def _process_shards_with_actors(
     # Track futures as list directly to avoid repeated dict->list conversion in ray.wait
     pending_list: list = []
     future_to_shard: dict = {}
+    future_to_start_time: dict = {}  # Track when each task was submitted
+
+    # Timeout configuration
+    task_warn_timeout = 120  # Log warning after 2 minutes
+    task_cancel_timeout = 600  # Cancel task after 10 minutes
 
     def submit_task(shard_index: int) -> None:
         nonlocal actor_idx
@@ -784,10 +898,14 @@ def _process_shards_with_actors(
         )
         pending_list.append(future)
         future_to_shard[future] = shard_index
+        future_to_start_time[future] = time.time()
 
     # Initial submission up to max_in_flight
     while shard_queue and len(pending_list) < max_in_flight:
         submit_task(shard_queue.pop(0))
+
+    # Track which tasks we've already warned about
+    warned_tasks: set = set()
 
     # Process with backpressure
     def process_loop(advance_fn: Callable[[], None]) -> None:
@@ -796,8 +914,56 @@ def _process_shards_with_actors(
             # ray.wait returns (done, remaining) - use remaining directly
             done, pending_list = ray.wait(pending_list, num_returns=1, timeout=60)
 
+            # Handle timeout: log info about long-running tasks
+            if not done and pending_list:
+                current_time = time.time()
+                tasks_to_cancel = []
+
+                for future in pending_list:
+                    shard_index = future_to_shard.get(future)
+                    start_time = future_to_start_time.get(future, current_time)
+                    elapsed = current_time - start_time
+
+                    # Check for tasks that should be cancelled
+                    if elapsed > task_cancel_timeout:
+                        tasks_to_cancel.append((future, shard_index, elapsed))
+                    # Log warning for long-running tasks (only once per task)
+                    elif elapsed > task_warn_timeout and future not in warned_tasks:
+                        warned_tasks.add(future)
+                        logger.warning(
+                            f"Shard {shard_index} has been running for {elapsed:.0f}s "
+                            f"(likely slow HuggingFace download)"
+                        )
+
+                # Cancel truly stuck tasks
+                for future, shard_index, elapsed in tasks_to_cancel:
+                    logger.error(
+                        f"Cancelling shard {shard_index} after {elapsed:.0f}s timeout"
+                    )
+                    try:
+                        ray.cancel(future, force=True)
+                    except Exception as e:
+                        logger.debug(f"Failed to cancel task: {e}")
+
+                    # Remove from tracking
+                    pending_list.remove(future)
+                    future_to_shard.pop(future, None)
+                    future_to_start_time.pop(future, None)
+                    warned_tasks.discard(future)
+
+                    # Count as completed (with error) to unblock progress
+                    advance_fn()
+
+                    # Submit replacement task if queue has more
+                    if shard_queue:
+                        submit_task(shard_queue.pop(0))
+
+                continue
+
             for future in done:
                 shard_index = future_to_shard.pop(future)
+                future_to_start_time.pop(future, None)
+                warned_tasks.discard(future)
                 try:
                     ray.get(future)
                     advance_fn()
@@ -1619,9 +1785,22 @@ def _process_chat_sft_blend(blend: DataBlend, config: PipelineConfig) -> Pipelin
             data_paths.append(prefix)
 
     # Generate blend.json
-    blend_data: dict = {"data_paths": data_paths}
-    if config.split:
-        blend_data["split"] = config.split
+    # Check if per-split output mode is enabled
+    if config.per_split is not None and config.per_split.enabled:
+        blend_data = _distribute_shards_to_splits(
+            data_paths=data_paths,
+            num_shards=num_shards,
+            valid_shards=config.per_split.valid_shards,
+            test_shards=config.per_split.test_shards,
+        )
+        is_per_split = True
+        split_ratio = None
+    else:
+        blend_data = {"data_paths": data_paths}
+        if config.split:
+            blend_data["split"] = config.split
+        is_per_split = False
+        split_ratio = config.split
 
     blend_path = config.output.dir / "blend.json"
     _write_json(blend_path, blend_data)
@@ -1640,8 +1819,8 @@ def _process_chat_sft_blend(blend: DataBlend, config: PipelineConfig) -> Pipelin
                 total_sequences=sum(r.get("num_sequences", 0) for r in results.values()),
             )
         },
-        is_per_split=False,
-        split_ratio=config.split,
+        is_per_split=is_per_split,
+        split_ratio=split_ratio,
         elapsed_sec=0,
     )
 

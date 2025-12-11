@@ -3,6 +3,9 @@
 Applies chat templates to OpenAI-format messages, tokenizes with role-based
 loss masking, and outputs packed .npy files compatible with GPTSFTPackedDataset.
 
+Outputs blend.json with {"train": [...], "valid": [...], "test": [...]} format
+compatible with Megatron-Bridge's per_split_data_args_path parameter.
+
 Pipeline:
 1. Apply nano3 chat template → role-labeled chunks
 2. Tokenize chunks → input_ids
@@ -20,6 +23,7 @@ from pathlib import Path
 from nemotron.data_prep import (
     DataBlend,
     PipelineConfig,
+    PerSplitConfig,
     OutputConfig,
     TokenizerConfig,
     ChatSftOutputConfig,
@@ -33,6 +37,9 @@ from nemotron.kit.wandb import add_wandb_tags, finish_wandb
 
 STAGE_PATH = Path(__file__).parent
 
+# Use NEMO_RUN_DIR for output when running via nemo-run (avoids writing to code dir)
+_OUTPUT_BASE = Path(os.environ.get("NEMO_RUN_DIR", "."))
+
 # Module-level flag for Ray execution (used by nemotron CLI)
 RAY = True
 
@@ -43,12 +50,13 @@ class SFTDataPrepConfig:
 
     Applies chat templates to OpenAI-format messages, tokenizes with role-based
     loss masking, and outputs packed .npy files.
+    Outputs {"train": [...], "valid": [...], "test": [...]} JSON format.
     """
 
     blend_path: Path = field(default_factory=lambda: STAGE_PATH / "data_blend_raw.json")
     """Path to data blend JSON file"""
 
-    output_dir: Path = field(default_factory=lambda: Path("./output/nano3/stage1_sft"))
+    output_dir: Path = field(default_factory=lambda: _OUTPUT_BASE / "output/nano3/stage1_sft")
     """Output directory for packed .npy data"""
 
     # Tokenizer
@@ -61,6 +69,13 @@ class SFTDataPrepConfig:
 
     shard_size: str = "256MB"
     """Target size per shard (e.g., '256MB', '1GB')"""
+
+    # Split configuration
+    valid_shards: int = 1
+    """Number of shards for validation split"""
+
+    test_shards: int = 1
+    """Number of shards for test split"""
 
     # Chat template
     chat_template: str = "nano3"
@@ -123,6 +138,11 @@ def main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
         tokenizer=TokenizerConfig(model=cfg.tokenizer_model),
         num_actors=num_actors,
         force=cfg.force,
+        per_split=PerSplitConfig(
+            enabled=True,
+            valid_shards=cfg.valid_shards,
+            test_shards=cfg.test_shards,
+        ),
     )
 
     # Run processing pipeline

@@ -2,18 +2,25 @@
 
 Tokenizes raw text data into Megatron bin/idx format.
 
+Outputs blend.json with {"train": [...], "valid": [...], "test": [...]} format
+compatible with Megatron-Bridge's per_split_data_args_path parameter.
+
 Usage:
     python -m nemotron.recipes.nano3.stage0_pretrain.data_prep [options]
 """
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from nemotron.data_prep import DataPrepConfig, run_data_prep
+from nemotron.data_prep import DataPrepConfig, PerSplitConfig, run_data_prep
 from nemotron.kit import DataBlendsArtifact, cli, print_step_complete
 from nemotron.kit.wandb import add_wandb_tags
 
 STAGE_PATH = Path(__file__).parent
+
+# Use NEMO_RUN_DIR for output when running via nemo-run (avoids writing to code dir)
+_OUTPUT_BASE = Path(os.environ.get("NEMO_RUN_DIR", "."))
 
 # Module-level flag for Ray execution (used by nemotron CLI)
 RAY = True
@@ -24,19 +31,23 @@ class PreTrainDataPrepConfig:
     """Pretrain data preparation config.
 
     Tokenizes text into Megatron bin/idx format for pretraining.
+    Outputs {"train": [...], "valid": [...], "test": [...]} JSON format.
     """
 
     blend_path: Path = field(default_factory=lambda: STAGE_PATH / "data_blend_raw.json")
     """Path to data blend JSON file"""
 
-    output_dir: Path = field(default_factory=lambda: Path("./output/nano3/stage0_pretrain"))
+    output_dir: Path = field(default_factory=lambda: _OUTPUT_BASE / "output/nano3/stage0_pretrain")
     """Output directory for tokenized data"""
 
     num_shards: int = 128
     """Number of output shards for parallel loading"""
 
-    split: str | None = "99990,8,2"
-    """Train:valid:test ratio (e.g., '99990,8,2') or None to disable"""
+    valid_shards: int = 1
+    """Number of shards for validation split"""
+
+    test_shards: int = 1
+    """Number of shards for test split"""
 
     tokenizer_model: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     """HuggingFace tokenizer model name"""
@@ -82,7 +93,11 @@ def main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
         blend_path=cfg.blend_path,
         output_dir=cfg.output_dir,
         num_shards=cfg.num_shards,
-        split=cfg.split,
+        per_split=PerSplitConfig(
+            enabled=True,
+            valid_shards=cfg.valid_shards,
+            test_shards=cfg.test_shards,
+        ),
         tokenizer_model=cfg.tokenizer_model,
         add_bos=cfg.add_bos,
         add_eos=cfg.add_eos,

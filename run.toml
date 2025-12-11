@@ -23,6 +23,7 @@ nodes = 1
 ntasks_per_node = 1
 gpus_per_node = 1
 container_image = "/lustre/fsw/portfolios/coreai/users/mromeijn/run/ray.sqsh"
+remote_job_dir = "/lustre/fsw/portfolios/coreai/users/mromeijn/run_prep"
 
 [megatron]
 extends = "dlw"

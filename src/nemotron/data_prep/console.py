@@ -72,6 +72,9 @@ def plan_summary(datasets: list[DatasetPlanInfo], run_hash: str, num_actors: int
     total_pending = 0
     total_cached = 0
 
+    # Collect data for W&B table
+    wandb_rows = []
+
     for ds in datasets:
         pending = ds.sampled if ds.sampled is not None else ds.pending
         total_pending += pending
@@ -79,8 +82,10 @@ def plan_summary(datasets: list[DatasetPlanInfo], run_hash: str, num_actors: int
 
         if pending == 0:
             status = "[green]cached[/green]"
+            status_plain = "cached"
         else:
             status = f"[yellow]{pending} to process[/yellow]"
+            status_plain = f"{pending} to process"
 
         cached_str = str(ds.cached) if ds.cached > 0 else "-"
 
@@ -98,6 +103,19 @@ def plan_summary(datasets: list[DatasetPlanInfo], run_hash: str, num_actors: int
 
         table.add_row(*row)
 
+        # Build W&B row (without Rich markup)
+        wandb_row = [ds.name]
+        if has_hf_metadata:
+            wandb_row.extend([ds.hf_size or "-", ds.hf_rows or "-"])
+        wandb_row.extend([
+            ds.num_shards,
+            ds.num_files,
+            ds.cached if ds.cached > 0 else 0,
+            pending if pending > 0 else 0,
+            status_plain,
+        ])
+        wandb_rows.append(wandb_row)
+
     console.print(table)
 
     # Summary line
@@ -110,6 +128,48 @@ def plan_summary(datasets: list[DatasetPlanInfo], run_hash: str, num_actors: int
             f"({total_cached} cached). Run hash: [yellow]{run_hash}[/yellow]"
         )
     console.print()
+
+    # Log to W&B if active
+    _log_plan_to_wandb(wandb_rows, has_hf_metadata, run_hash, num_actors, total_pending, total_cached)
+
+
+def _log_plan_to_wandb(
+    rows: list[list],
+    has_hf_metadata: bool,
+    run_hash: str,
+    num_actors: int,
+    total_pending: int,
+    total_cached: int,
+) -> None:
+    """Log execution plan as W&B Table."""
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        # Build column names
+        columns = ["Dataset"]
+        if has_hf_metadata:
+            columns.extend(["Size", "Rows"])
+        columns.extend(["Shards", "Files", "Cached", "Pending", "Status"])
+
+        # Create W&B table
+        wandb_table = wandb.Table(columns=columns, data=rows)
+
+        # Log the table
+        wandb.log({
+            "data_prep/execution_plan": wandb_table,
+            "data_prep/run_hash": run_hash,
+            "data_prep/num_workers": num_actors,
+            "data_prep/total_pending_shards": total_pending,
+            "data_prep/total_cached_shards": total_cached,
+            "data_prep/num_datasets": len(rows),
+        })
+    except ImportError:
+        pass
+    except Exception:
+        pass  # Don't fail pipeline on W&B errors
 
 
 def execution_header() -> None:

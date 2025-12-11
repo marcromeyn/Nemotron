@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nemotron.kit import App
+from nemotron.kit.artifact import ArtifactInput
 
 from nemotron.recipes.nano3.stage0_pretrain.data_prep import PreTrainDataPrepConfig
 from nemotron.recipes.nano3.stage0_pretrain.data_prep import main as pretrain_data_main
@@ -115,7 +116,18 @@ prep.command("rl", RLDataPrepConfig, rl_data_main, description="Prepare data for
 data.command("curate", DataCurateConfig, curate_main, description="Curate training data with NeMo Curator (coming soon)")
 
 # Top-level training commands
-app.command("pretrain", TrainingConfig, training_main, description="Run pretraining with Megatron-Bridge (stage0)")
+app.command(
+    "pretrain",
+    TrainingConfig,
+    training_main,
+    description="Run pretraining with Megatron-Bridge (stage0)",
+    artifacts={
+        "data": ArtifactInput(
+            default_name="DataBlendsArtifact-pretrain",
+            mappings={"path": "data.data_path"},
+        ),
+    },
+)
 app.command("sft", SftConfig, sft_main, description="Run supervised fine-tuning with Megatron-Bridge (coming soon)")
 app.command("rl", RlConfig, rl_main, description="Run reinforcement learning with NeMo-RL (coming soon)")
 

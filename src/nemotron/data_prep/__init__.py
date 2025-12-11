@@ -53,6 +53,7 @@ from pathlib import Path
 from nemotron.data_prep.blend import DataBlend, Dataset
 from nemotron.data_prep.config import (
     PipelineConfig,
+    PerSplitConfig,
     TokenizerConfig,
     OutputConfig,
     BinIdxOutputConfig,
@@ -111,8 +112,13 @@ class DataPrepConfig:
     num_shards: int = 128
     """Number of output shards for parallel loading"""
 
-    split: str | None = "99990,8,2"
-    """Train:valid:test ratio (e.g., '99990,8,2') or None to disable"""
+    split: str | None = None
+    """Deprecated: Train:valid:test ratio (e.g., '99990,8,2'). Use per_split instead."""
+
+    per_split: PerSplitConfig | None = field(default_factory=PerSplitConfig)
+    """Per-split output config. Produces {"train": [...], "valid": [...], "test": [...]} JSON
+    compatible with Megatron-Bridge's per_split_data_args_path parameter.
+    Set to None to use legacy split ratio mode."""
 
     # Tokenizer
     tokenizer_model: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -214,7 +220,33 @@ def run_data_prep(config: DataPrepConfig) -> DataBlendsArtifact:
         num_actors=num_actors,
         force=config.force,
         split=config.split,
+        per_split=config.per_split,
     )
+
+    # Initialize Ray with runtime_env excludes to prevent large directories from
+    # being packaged. Without this, Ray auto-packages the working directory when
+    # actors are created, which can exceed the 512MB GCS limit if output/ or other
+    # large directories are present.
+    import ray
+
+    if not ray.is_initialized():
+        runtime_env = {
+            "excludes": [
+                "output/",
+                "outputs/",
+                "wandb/",
+                "data/",
+                "checkpoints/",
+                "*.bin",
+                "*.idx",
+                "*.npy",
+                "__pycache__/",
+                ".git/",
+                ".venv/",
+                "*.egg-info/",
+            ]
+        }
+        ray.init(address="auto", ignore_reinit_error=True, runtime_env=runtime_env)
 
     # Run processing pipeline
     result = last_mile_process(blend, pipeline_config)
@@ -300,6 +332,7 @@ __all__ = [
     "DataBlendsArtifact",
     # Low-level configuration
     "PipelineConfig",
+    "PerSplitConfig",
     "TokenizerConfig",
     "OutputConfig",
     # Output format configs

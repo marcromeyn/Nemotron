@@ -30,11 +30,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, make_dataclass
 from pathlib import Path
-from typing import Annotated, Any, Callable, Union
+from typing import Annotated, Any, Callable, Union, get_args, get_origin, get_type_hints, is_typeddict
 
 import tyro
 from tyro.conf import OmitArgPrefixes, OmitSubcommandPrefixes, subcommand
 
+from nemotron.kit.artifact import ArtifactInput
 from nemotron.kit.wandb import WandbConfig
 
 
@@ -97,6 +98,105 @@ class GlobalOptions:
         )
 
 
+def _make_artifact_options_class(artifacts: dict[str, ArtifactInput]) -> type:
+    """Create a dynamic dataclass for artifact options.
+
+    Args:
+        artifacts: Dict mapping artifact slot names to ArtifactInput definitions
+
+    Returns:
+        A dataclass with fields like art_data, art_checkpoint, etc.
+    """
+    fields = []
+    for slot_name, artifact_input in artifacts.items():
+        # Field name: art_<slot_name> (e.g., art_data)
+        field_name = f"art_{slot_name}"
+
+        # Help text shows the default artifact name prominently
+        help_text = (
+            f"W&B artifact reference. Default: {artifact_input.default_name}. "
+            f"Use version only (v10, latest) or full path (entity/project/name:version)."
+        )
+
+        # Create annotated field with tyro.conf.arg for proper CLI naming
+        annotated_type = Annotated[
+            str | None,
+            tyro.conf.arg(name=f"art.{slot_name}", help=help_text),
+        ]
+
+        fields.append((field_name, annotated_type, field(default=None)))
+
+    # Create the dataclass
+    artifact_options_class = make_dataclass(
+        "_ArtifactOptions",
+        fields,
+        frozen=True,
+    )
+    artifact_options_class.__doc__ = "Artifact inputs (resolve W&B artifacts to local paths)."
+
+    return artifact_options_class
+
+
+def _typeddict_to_dataclass(td: type, prefix: str = "") -> type:
+    """Convert a TypedDict to a dataclass for tyro CLI parsing.
+
+    Args:
+        td: A TypedDict class (with total=False for optional fields)
+        prefix: Optional prefix for CLI arg names (e.g., "fn." -> "--fn.field-name")
+
+    Returns:
+        A dataclass with the same fields, all optional with None defaults.
+        Each field is annotated with tyro.conf.arg for proper CLI naming.
+
+    Raises:
+        TypeError: If td is not a TypedDict
+
+    Example:
+        >>> class MyKwargs(TypedDict, total=False):
+        ...     per_split_data_args_path: str | None
+        ...     seq_length: int
+        ...
+        >>> dc = _typeddict_to_dataclass(MyKwargs, prefix="fn.")
+        >>> # Creates a dataclass with --fn.per-split-data-args-path and --fn.seq-length CLI args
+    """
+    if not is_typeddict(td):
+        raise TypeError(f"{td} is not a TypedDict")
+
+    hints = get_type_hints(td)
+
+    # Build field list - all fields get None default (total=False semantics)
+    fields = []
+    for name, type_hint in hints.items():
+        # Convert underscore to hyphen for CLI arg name
+        cli_name = f"{prefix}{name.replace('_', '-')}"
+
+        # Wrap in Optional if not already, with None default
+        origin = get_origin(type_hint)
+        if origin is Union:
+            args = get_args(type_hint)
+            if type(None) not in args:
+                type_hint = type_hint | None
+        else:
+            type_hint = type_hint | None
+
+        # Create annotated type with proper CLI name
+        annotated_type = Annotated[
+            type_hint,
+            tyro.conf.arg(name=cli_name),
+        ]
+
+        fields.append((name, annotated_type, field(default=None)))
+
+    result = make_dataclass(
+        f"_{td.__name__}Cli",
+        fields,
+        frozen=True,
+    )
+    result.__doc__ = td.__doc__ or f"CLI arguments from {td.__name__}"
+
+    return result
+
+
 class App:
     """CLI application with nested subcommand support.
 
@@ -137,7 +237,8 @@ class App:
         """
         self.name = name
         self.description = description
-        self._commands: list[tuple[str, type, Callable, str]] = []
+        # Commands: (name, config, handler, description, artifacts, defaults_fn, kwargs_schema)
+        self._commands: list[tuple[str, type, Callable, str, dict[str, ArtifactInput] | None, Callable[..., Any] | None, type | None]] = []
         self._groups: dict[str, App] = {}
 
     def group(self, name: str, description: str = "") -> App:
@@ -160,6 +261,9 @@ class App:
         config: type,
         handler: Callable,
         description: str = "",
+        artifacts: dict[str, ArtifactInput] | None = None,
+        defaults_fn: Callable[..., Any] | None = None,
+        kwargs_schema: type | None = None,
     ) -> None:
         """Register a command with its config and handler.
 
@@ -168,33 +272,102 @@ class App:
             config: Dataclass type for command configuration
             handler: Function to call with the parsed config
             description: Description shown in help text (defaults to config's docstring)
-        """
-        self._commands.append((name, config, handler, description or config.__doc__ or ""))
+            artifacts: Named artifact inputs that can be provided via --art.<name>.
+                      Each ArtifactInput defines a default artifact name and mappings
+                      from artifact metadata fields to config field paths.
+                      Use "fn." prefix in mapping values to pass to defaults_fn():
+                      {"blend_path": "fn.per_split_data_args_path"}
+            defaults_fn: Optional callable that returns a default config instance.
+                        Called with kwargs extracted from artifact mappings with "fn."
+                        prefix. Useful for recipe functions that need runtime arguments.
+            kwargs_schema: Optional TypedDict class defining kwargs for defaults_fn.
+                          Fields from this TypedDict become CLI arguments (--fn.<field-name>)
+                          that are passed to defaults_fn(). Requires defaults_fn to be set.
 
-    def _build_union(self, include_global_options: bool = False) -> tuple[type, dict[type, Callable]]:
-        """Build Union type and handler mapping for tyro.
+        Example:
+            >>> app.command(
+            ...     "pretrain",
+            ...     TrainingConfig,
+            ...     training_main,
+            ...     artifacts={
+            ...         "data": ArtifactInput(
+            ...             default_name="DataBlendsArtifact-pretrain",
+            ...             mappings={"path": "dataset.data_path"},
+            ...         ),
+            ...     },
+            ... )
+
+            >>> # With defaults_fn, kwargs_schema, and fn. prefix
+            >>> app.command(
+            ...     "pretrain",
+            ...     ConfigContainer,
+            ...     training_main,
+            ...     defaults_fn=nano_3_pretrain_config,
+            ...     kwargs_schema=NemotronHCommonKwargs,  # TypedDict for CLI args
+            ...     artifacts={
+            ...         "data": ArtifactInput(
+            ...             default_name="DataBlendsArtifact-pretrain",
+            ...             mappings={"blend_path": "fn.per_split_data_args_path"},
+            ...         ),
+            ...     },
+            ... )
+        """
+        if kwargs_schema is not None and defaults_fn is None:
+            raise ValueError("kwargs_schema requires defaults_fn to be set")
+        self._commands.append((name, config, handler, description or config.__doc__ or "", artifacts, defaults_fn, kwargs_schema))
+
+    def _build_union(
+        self, include_global_options: bool = False
+    ) -> tuple[type, dict[type, Callable], dict[type, dict[str, ArtifactInput] | None], dict[type, Callable[..., Any] | None], dict[type, type | None]]:
+        """Build Union type, handler mapping, artifacts mapping, defaults_fn mapping, and kwargs_schema mapping for tyro.
 
         Args:
             include_global_options: Whether to include GlobalOptions in leaf commands
 
         Returns:
-            Tuple of (Union type for tyro, dict mapping config types to handlers)
+            Tuple of (Union type for tyro, dict mapping config types to handlers,
+                     dict mapping config types to their artifact definitions,
+                     dict mapping config types to their defaults_fn callables,
+                     dict mapping config types to their kwargs_schema TypedDict classes)
         """
         handlers: dict[type, Callable] = {}
+        artifacts_map: dict[type, dict[str, ArtifactInput] | None] = {}
+        defaults_fn_map: dict[type, Callable[..., Any] | None] = {}
+        kwargs_schema_map: dict[type, type | None] = {}
         union_members: list[type] = []
 
         # Add direct commands
-        for name, config, handler, desc in self._commands:
+        for name, config, handler, desc, artifacts, defaults_fn, kwargs_schema in self._commands:
             if include_global_options:
                 # Create a wrapper that includes both config and global options
                 # Command config first, global options last (appears at bottom of help)
                 # Use Annotated with arg(name="global") to avoid trailing dash in help
+                wrapper_fields = [
+                    (name, Annotated[config, OmitArgPrefixes]),
+                ]
+
+                # Add kwargs_schema options if defined (appears before artifacts)
+                if kwargs_schema is not None:
+                    kwargs_options_class = _typeddict_to_dataclass(kwargs_schema, prefix="fn.")
+                    wrapper_fields.append(
+                        ("fn_", Annotated[kwargs_options_class, tyro.conf.arg(name="fn")])
+                    )
+
+                # Add artifact options if defined for this command
+                if artifacts:
+                    artifact_options_class = _make_artifact_options_class(artifacts)
+                    wrapper_fields.append(
+                        ("art_", Annotated[artifact_options_class, tyro.conf.arg(name="art")])
+                    )
+
+                # Global options always at the end
+                wrapper_fields.append(
+                    ("global_", Annotated[GlobalOptions, tyro.conf.arg(name="global")])
+                )
+
                 wrapper = make_dataclass(
                     f"_{config.__name__}WithGlobal",
-                    [
-                        (name, Annotated[config, OmitArgPrefixes]),
-                        ("global_", Annotated[GlobalOptions, tyro.conf.arg(name="global")]),
-                    ],
+                    wrapper_fields,
                     frozen=True,
                 )
                 wrapper.__doc__ = config.__doc__
@@ -204,15 +377,27 @@ class App:
                 # (wrapper for lookup before unwrap, config for lookup after unwrap)
                 handlers[wrapper] = handler
                 handlers[config] = handler
+                # Store artifacts mapping for the unwrapped config type
+                artifacts_map[config] = artifacts
+                # Store defaults_fn for the unwrapped config type
+                defaults_fn_map[config] = defaults_fn
+                # Store kwargs_schema for the unwrapped config type
+                kwargs_schema_map[config] = kwargs_schema
             else:
                 annotated = Annotated[config, subcommand(name=name, description=desc, prefix_name=False)]
                 union_members.append(annotated)
                 handlers[config] = handler
+                artifacts_map[config] = artifacts
+                defaults_fn_map[config] = defaults_fn
+                kwargs_schema_map[config] = kwargs_schema
 
         # Add groups as wrapper dataclasses
         for group_name, group_app in self._groups.items():
-            group_union, group_handlers = group_app._build_union(include_global_options)
+            group_union, group_handlers, group_artifacts, group_defaults_fn, group_kwargs_schema = group_app._build_union(include_global_options)
             handlers.update(group_handlers)
+            artifacts_map.update(group_artifacts)
+            defaults_fn_map.update(group_defaults_fn)
+            kwargs_schema_map.update(group_kwargs_schema)
 
             # Create wrapper dataclass with OmitArgPrefixes and OmitSubcommandPrefixes on the field
             wrapper = make_dataclass(
@@ -227,29 +412,34 @@ class App:
             # Mark wrapper for unwrapping (handler=None signals it's a wrapper)
             handlers[wrapper] = None  # type: ignore
 
-        return Union[tuple(union_members)], handlers  # type: ignore
+        return Union[tuple(union_members)], handlers, artifacts_map, defaults_fn_map, kwargs_schema_map  # type: ignore
 
-    def build(self, include_global_options: bool = False) -> tuple[type, dict[type, Callable]]:
-        """Build the tyro-compatible Union type and handler mapping.
+    def build(
+        self, include_global_options: bool = False
+    ) -> tuple[type, dict[type, Callable], dict[type, dict[str, ArtifactInput] | None], dict[type, Callable[..., Any] | None], dict[type, type | None]]:
+        """Build the tyro-compatible Union type, handler mapping, artifacts mapping, defaults_fn mapping, and kwargs_schema mapping.
 
         Args:
             include_global_options: Whether to include GlobalOptions in leaf commands
 
         Returns:
-            Tuple of (annotated Union type for tyro.cli, handler mapping)
+            Tuple of (annotated Union type for tyro.cli, handler mapping, artifacts mapping, defaults_fn mapping, kwargs_schema mapping)
         """
-        union_type, handlers = self._build_union(include_global_options)
+        union_type, handlers, artifacts_map, defaults_fn_map, kwargs_schema_map = self._build_union(include_global_options)
         # Create annotated type for tyro.cli - OmitArgPrefixes removes prefixes from args
         annotated_union = Annotated[union_type, OmitArgPrefixes]  # type: ignore
-        return annotated_union, handlers
+        return annotated_union, handlers, artifacts_map, defaults_fn_map, kwargs_schema_map
 
     def run(self) -> None:
         """Run the CLI application.
 
         This method:
         1. Checks for --run flag and dispatches to nemo-run if specified
-        2. Loads config file if --config-file is specified
-        3. Parses remaining args with tyro and invokes the handler
+        2. Reads stdin artifacts if piped
+        3. Extracts fn. kwargs from artifact mappings for defaults_fn
+        4. Parses args with tyro (including --art.<name> options)
+        5. Applies artifact references to config
+        6. Invokes the handler
         """
         import sys
 
@@ -261,32 +451,89 @@ class App:
             _execute_with_nemo_run(run_name, run_overrides, remaining_args)
             return
 
+        # Read stdin artifacts if piped (for pipeline composition)
+        from nemotron.kit.config import _read_stdin_artifacts, _load_artifact_metadata
+        stdin_artifacts = _read_stdin_artifacts()
+
         # Pre-process: extract config file path (but don't load yet - we need the config class)
         # TODO: Config file loading requires knowing the config class, which we only know
         # after subcommand parsing. For now, just filter out the arg.
         filtered_args = _filter_config_file_args(remaining_args)
 
-        # Build tyro Union type and handler mapping with global options
-        union_type, handlers = self.build(include_global_options=True)
+        # Build tyro Union type, handler mapping, artifacts mapping, defaults_fn mapping, and kwargs_schema mapping with global options
+        union_type, handlers, artifacts_map, defaults_fn_map, kwargs_schema_map = self.build(include_global_options=True)
 
         # Run tyro directly on the Union type (not a function) for cleaner help output
+        # tyro now parses --art.<name>, --fn.<name> options directly
         config = tyro.cli(union_type, args=filtered_args, description=self.description)
 
         # Unwrap nested wrappers - check for any single-field wrapper dataclass
-        # Also handles the config+global_ wrapper
+        # Also handles the config+fn_+art_+global_ wrapper
         global_options: GlobalOptions | None = None
+        art_refs: dict[str, str] = {}
+        cli_fn_kwargs: dict[str, Any] = {}
         while True:
             fields = getattr(config, "__dataclass_fields__", {})
             if len(fields) == 1:
                 field_name = next(iter(fields))
                 config = getattr(config, field_name)
-            elif "global_" in fields and len(fields) == 2:
-                # This is a command wrapper with global options - extract both
+            elif "global_" in fields:
+                # This is a command wrapper with global options (and possibly fn_, art_)
                 global_options = getattr(config, "global_")
-                config_field = next(f for f in fields if f != "global_")
+
+                # Extract fn_ kwargs if present (from kwargs_schema CLI args)
+                if "fn_" in fields:
+                    fn_options = getattr(config, "fn_")
+                    # Convert fn_ dataclass fields to cli_fn_kwargs dict
+                    for field_name in getattr(fn_options, "__dataclass_fields__", {}):
+                        value = getattr(fn_options, field_name)
+                        if value is not None:
+                            cli_fn_kwargs[field_name] = value
+
+                # Extract artifact refs if present
+                if "art_" in fields:
+                    art_options = getattr(config, "art_")
+                    # Convert art_ dataclass fields to art_refs dict
+                    for field_name in getattr(art_options, "__dataclass_fields__", {}):
+                        value = getattr(art_options, field_name)
+                        if value is not None:
+                            # field_name is like "art_data" -> slot_name is "data"
+                            slot_name = field_name[4:]  # Remove "art_" prefix
+                            art_refs[slot_name] = value
+
+                # Find the config field (not global_, fn_, or art_)
+                config_field = next(f for f in fields if f not in ("global_", "fn_", "art_"))
                 config = getattr(config, config_field)
             else:
                 break
+
+        # Get artifacts definition and defaults_fn for this config type
+        artifacts = artifacts_map.get(type(config))
+        defaults_fn = defaults_fn_map.get(type(config))
+
+        # Build fn_kwargs: CLI kwargs as base, artifact fn. kwargs override
+        fn_kwargs: dict[str, Any] = dict(cli_fn_kwargs)  # Start with CLI kwargs
+
+        # Extract fn. kwargs from artifact mappings (these override CLI kwargs)
+        if stdin_artifacts and artifacts:
+            artifact_fn_kwargs = _extract_fn_kwargs_from_artifacts(stdin_artifacts, artifacts)
+            fn_kwargs.update(artifact_fn_kwargs)  # Artifact values take precedence
+
+        # Call defaults_fn if provided with combined kwargs
+        if defaults_fn is not None and fn_kwargs:
+            # Call defaults_fn with extracted kwargs
+            # Note: The result is used as defaults, but since tyro already parsed,
+            # we apply any values from defaults_fn that weren't overridden by CLI
+            default_config = defaults_fn(**fn_kwargs)
+            # For now, we just invoke defaults_fn for its side effects and tracking
+            # The actual config values come from tyro parsing and artifact application below
+
+        # Apply artifact references to config by constructing art:// URIs
+        # and letting the resolve_artifact_uri function handle resolution
+        if (art_refs or stdin_artifacts) and artifacts:
+            config = _apply_artifact_refs_to_config(
+                config, art_refs, stdin_artifacts, artifacts
+            )
 
         # Initialize wandb from global options or run.toml
         if global_options is not None and global_options.wandb_project is not None:
@@ -310,6 +557,52 @@ class App:
         result = handler(config)
         if isinstance(result, int) and result != 0:
             sys.exit(result)
+
+
+def _extract_fn_kwargs_from_artifacts(
+    stdin_artifacts: dict[str, dict],
+    artifacts: dict[str, ArtifactInput],
+) -> dict[str, Any]:
+    """Extract fn. kwargs from artifact mappings for defaults_fn.
+
+    Iterates through all artifact inputs and their mappings. For mappings
+    with "fn." prefix in the target, loads the artifact metadata and
+    extracts the value to pass as a kwarg to defaults_fn().
+
+    Args:
+        stdin_artifacts: Artifacts piped from stdin (from previous step)
+        artifacts: ArtifactInput definitions for this command
+
+    Returns:
+        Dict of kwargs to pass to defaults_fn()
+    """
+    from nemotron.kit.config import _load_artifact_metadata
+
+    fn_kwargs: dict[str, Any] = {}
+
+    for slot_name, artifact_input in artifacts.items():
+        if slot_name not in stdin_artifacts:
+            continue
+
+        # Load artifact metadata
+        try:
+            metadata = _load_artifact_metadata(stdin_artifacts[slot_name])
+        except FileNotFoundError:
+            continue
+
+        # Check each mapping for fn. prefix
+        for artifact_field, target in artifact_input.mappings.items():
+            if not target.startswith("fn."):
+                continue
+
+            # Extract kwarg name (remove "fn." prefix)
+            kwarg_name = target[3:]
+
+            # Get value from metadata
+            if artifact_field in metadata:
+                fn_kwargs[kwarg_name] = metadata[artifact_field]
+
+    return fn_kwargs
 
 
 def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str]]:
@@ -355,6 +648,190 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
             i += 1
 
     return run_name, run_overrides, remaining
+
+
+def _apply_artifact_refs_to_config(
+    config: Any,
+    art_refs: dict[str, str],
+    stdin_artifacts: dict[str, dict] | None,
+    artifacts: dict[str, ArtifactInput],
+) -> Any:
+    """Apply artifact references to config after tyro parsing.
+
+    This function:
+    1. Constructs art:// URIs from artifact references
+    2. Resolves them to local paths via resolve_artifact_uri
+    3. Updates the config fields according to the mappings
+
+    Args:
+        config: The parsed config dataclass
+        art_refs: Mapping from artifact slot names to references (from --art.<name>)
+        stdin_artifacts: Artifacts piped from stdin (from previous step)
+        artifacts: ArtifactInput definitions for this command
+
+    Returns:
+        Updated config with artifact paths resolved
+    """
+    from dataclasses import fields as dataclass_fields, replace
+    from nemotron.kit.config import resolve_artifact_uri
+
+    updates: dict[str, Any] = {}
+
+    # Process --art.<name> references (highest priority)
+    for slot_name, ref in art_refs.items():
+        if slot_name not in artifacts:
+            continue
+
+        artifact_input = artifacts[slot_name]
+
+        # Build the full art:// URI from the reference
+        art_uri = _build_art_uri(ref, artifact_input.default_name)
+
+        # Apply each mapping (skip fn. prefixed targets - those are for defaults_fn)
+        for artifact_field, config_field in artifact_input.mappings.items():
+            # Skip fn. prefixed targets - those are handled by defaults_fn
+            if config_field.startswith("fn."):
+                continue
+
+            # Build full URI with file path if specified
+            if artifact_field and not artifact_field.startswith("metadata."):
+                full_uri = f"{art_uri}/{artifact_field}"
+            else:
+                full_uri = art_uri
+
+            # Resolve to local path
+            local_path = resolve_artifact_uri(full_uri)
+
+            # Set the config field (supports nested paths like "dataset.data_path")
+            _set_nested_field(config, config_field, local_path, updates)
+
+    # Process stdin artifacts (lower priority than --art.<name>)
+    if stdin_artifacts:
+        for slot_name, artifact_info in stdin_artifacts.items():
+            if slot_name not in artifacts:
+                continue
+
+            # Skip if already provided via --art.<name>
+            if slot_name in art_refs:
+                continue
+
+            artifact_input = artifacts[slot_name]
+            artifact_path = artifact_info.get("path")
+
+            if artifact_path:
+                for artifact_field, config_field in artifact_input.mappings.items():
+                    # Skip fn. prefixed targets - those are handled by defaults_fn
+                    if config_field.startswith("fn."):
+                        continue
+
+                    if artifact_field:
+                        full_path = f"{artifact_path}/{artifact_field}"
+                    else:
+                        full_path = artifact_path
+
+                    _set_nested_field(config, config_field, full_path, updates)
+
+    # Apply updates to config using dataclass replace
+    if updates:
+        config = _apply_nested_updates(config, updates)
+
+    return config
+
+
+def _set_nested_field(config: Any, field_path: str, value: Any, updates: dict[str, Any]) -> None:
+    """Set a nested field value in the updates dict.
+
+    Args:
+        config: The config dataclass (for type checking)
+        field_path: Dot-separated field path like "dataset.data_path"
+        value: Value to set
+        updates: Dict to store updates (modified in place)
+    """
+    parts = field_path.split(".")
+    if len(parts) == 1:
+        updates[field_path] = value
+    else:
+        # Nested field - store as nested dict
+        current = updates
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+
+
+def _apply_nested_updates(config: Any, updates: dict[str, Any]) -> Any:
+    """Apply nested updates to a dataclass config.
+
+    Args:
+        config: The config dataclass
+        updates: Dict of updates (may be nested)
+
+    Returns:
+        Updated config
+    """
+    from dataclasses import replace, is_dataclass
+
+    flat_updates = {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and hasattr(config, key):
+            # Nested update - recurse into the nested dataclass
+            nested_config = getattr(config, key)
+            if is_dataclass(nested_config):
+                flat_updates[key] = _apply_nested_updates(nested_config, value)
+            else:
+                flat_updates[key] = value
+        else:
+            flat_updates[key] = value
+
+    return replace(config, **flat_updates)
+
+
+def _build_art_uri(ref: str, default_name: str) -> str:
+    """Build a full art:// URI from an artifact reference.
+
+    Args:
+        ref: Artifact reference in various formats:
+             - "v10" or "latest" -> use default_name
+             - "Name:version" -> use as-is
+             - "entity/project/name:version" -> full W&B path
+        default_name: Default artifact name for version-only references
+
+    Returns:
+        Full art:// URI
+
+    Examples:
+        >>> _build_art_uri("v10", "DataBlendsArtifact-pretrain")
+        "art://DataBlendsArtifact-pretrain:v10"
+        >>> _build_art_uri("latest", "DataBlendsArtifact-pretrain")
+        "art://DataBlendsArtifact-pretrain:latest"
+        >>> _build_art_uri("DataBlendsArtifact-pretrain:v5", "default")
+        "art://DataBlendsArtifact-pretrain:v5"
+        >>> _build_art_uri("romeyn/nemotron/DataBlendsArtifact-pretrain:v10", "default")
+        "art://romeyn/nemotron/DataBlendsArtifact-pretrain:v10"
+    """
+    # Already an art:// URI
+    if ref.startswith("art://"):
+        return ref
+
+    # Check if it's a version-only reference (e.g., "v10", "latest", "10")
+    is_version_only = (
+        ref == "latest"
+        or ref.startswith("v") and ref[1:].isdigit()
+        or ref.isdigit()
+    )
+
+    if is_version_only:
+        # Use default artifact name with the version
+        version = ref if ref == "latest" or ref.startswith("v") else f"v{ref}"
+        return f"art://{default_name}:{version}"
+
+    # Has a colon - could be name:version or entity/project/name:version
+    if ":" in ref:
+        return f"art://{ref}"
+
+    # No version specifier - assume it's a name and use :latest
+    return f"art://{ref}:latest"
 
 
 def _append_wandb_args(args: list[str], wandb_config: WandbConfig) -> list[str]:
@@ -453,6 +930,9 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
             sys.exit(1)
 
         with run.Experiment(experiment_name) as exp:
+            # Inject experiment_id for artifact aliasing across tasks
+            executor.env_vars["NEMO_EXPERIMENT_ID"] = exp._id
+
             exp.add(
                 run.Script(
                     path="nemotron",

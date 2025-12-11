@@ -36,6 +36,9 @@ from nemotron.kit.wandb import add_wandb_tags, finish_wandb
 
 STAGE_PATH = Path(__file__).parent
 
+# Use NEMO_RUN_DIR for output when running via nemo-run (avoids writing to code dir)
+_OUTPUT_BASE = Path(os.environ.get("NEMO_RUN_DIR", "."))
+
 # Module-level flag for Ray execution (used by nemotron CLI)
 RAY = True
 
@@ -51,7 +54,7 @@ class RLDataPrepConfig:
     blend_path: Path = field(default_factory=lambda: STAGE_PATH / "data_blend_raw.json")
     """Path to data blend JSON file"""
 
-    output_dir: Path = field(default_factory=lambda: Path("./output/nano3/stage2_rl"))
+    output_dir: Path = field(default_factory=lambda: _OUTPUT_BASE / "output/nano3/stage2_rl")
     """Output directory for JSONL data"""
 
     shard_size: str = "256MB"

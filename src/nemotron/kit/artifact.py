@@ -6,6 +6,7 @@ Provides the Artifact base class, typed subclasses, and utilities.
 
 import json
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Self
@@ -287,6 +288,7 @@ class Artifact(BaseModel):
         uri_path = uri[6:]  # Remove "art://"
 
         # Parse name and version
+        version: int | str | None
         if ":" in uri_path:
             name, version_str = uri_path.rsplit(":", 1)
             if version_str == "latest":
@@ -294,7 +296,11 @@ class Artifact(BaseModel):
             elif version_str.startswith("v"):
                 version = int(version_str[1:])
             else:
-                version = int(version_str)
+                # Try numeric; otherwise treat as alias
+                try:
+                    version = int(version_str)
+                except ValueError:
+                    version = version_str  # Alias string
         else:
             name = uri_path
             version = None
@@ -424,6 +430,56 @@ class ModelArtifact(Artifact):
 
     step: Annotated[int, Field(ge=0, description="Training step")]
     final_loss: Annotated[float | None, Field(default=None, description="Final training loss")]
+
+
+# =============================================================================
+# Artifact Input for CLI Commands
+# =============================================================================
+
+
+@dataclass
+class ArtifactInput:
+    """Defines an artifact input slot for a CLI command.
+
+    Used with App.command() to specify named artifact inputs that can be
+    provided via --art.<name> CLI arguments or stdin piping.
+
+    Example:
+        >>> app.command(
+        ...     "pretrain",
+        ...     TrainingConfig,
+        ...     training_main,
+        ...     artifacts={
+        ...         "data": ArtifactInput(
+        ...             default_name="DataBlendsArtifact-pretrain",
+        ...             mappings={"path": "dataset.data_path"},
+        ...         ),
+        ...     },
+        ... )
+
+    Then users can run:
+        nemotron nano3 pretrain --art.data v10
+        nemotron nano3 pretrain --art.data DataBlendsArtifact-pretrain:latest
+        nemotron nano3 pretrain --art.data romeyn/nemotron/DataBlendsArtifact-pretrain:v10
+    """
+
+    default_name: str
+    """Default W&B artifact name (e.g., 'DataBlendsArtifact-pretrain').
+
+    Used when only a version is provided (e.g., --art.data v10 or --art.data latest).
+    """
+
+    mappings: dict[str, str]
+    """Mapping from artifact metadata fields to config field paths.
+
+    Keys are field names from the artifact's metadata.json (e.g., 'path').
+    Values are dot-separated config field paths (e.g., 'dataset.data_path').
+
+    Example: {"path": "dataset.data_path"} means:
+    - Load artifact metadata
+    - Get metadata["path"] value
+    - Set config.dataset.data_path = that value
+    """
 
 
 # =============================================================================

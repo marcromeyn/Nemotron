@@ -160,41 +160,6 @@
       "subset": "Nemotron-Pretraining-Wiki-Rewrite",
       "text_field": "text",
       "weight": 1.0
-    },
-    {
-      "name": "nemotron-code-v2-synthetic-code-review",
-      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
-      "subset": "Synthetic-Code/synthetic-code-review",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-code-v2-synthetic-question-answering",
-      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
-      "subset": "Synthetic-Code/synthetic-question-answering",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-code-v2-synthetic-rewriting",
-      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
-      "subset": "Synthetic-Code/synthetic-rewriting",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-code-v2-synthetic-student-teacher",
-      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
-      "subset": "Synthetic-Code/synthetic-student-teacher",
-      "text_field": "text",
-      "weight": 1.0
-    },
-    {
-      "name": "nemotron-code-v2-synthetic-transpilation",
-      "path": "hf://nvidia/Nemotron-Pretraining-Code-v2",
-      "subset": "Synthetic-Code/synthetic-transpilation",
-      "text_field": "text",
-      "weight": 1.0
     }
   ]
 }
