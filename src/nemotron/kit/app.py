@@ -237,9 +237,11 @@ class App:
         """
         self.name = name
         self.description = description
-        # Commands: (name, config, handler, description, artifacts, defaults_fn, kwargs_schema)
-        self._commands: list[tuple[str, type, Callable, str, dict[str, ArtifactInput] | None, Callable[..., Any] | None, type | None]] = []
+        # Commands: (name, config, handler, description, artifacts, defaults_fn, kwargs_schema, script_path)
+        self._commands: list[tuple[str, type, Callable, str, dict[str, ArtifactInput] | None, Callable[..., Any] | None, type | None, str | None]] = []
         self._groups: dict[str, App] = {}
+        # Script paths for direct execution (subcommand -> script_path)
+        self._script_paths: dict[str, str] = {}
 
     def group(self, name: str, description: str = "") -> App:
         """Create a nested command group.
@@ -264,6 +266,7 @@ class App:
         artifacts: dict[str, ArtifactInput] | None = None,
         defaults_fn: Callable[..., Any] | None = None,
         kwargs_schema: type | None = None,
+        script_path: str | None = None,
     ) -> None:
         """Register a command with its config and handler.
 
@@ -283,6 +286,12 @@ class App:
             kwargs_schema: Optional TypedDict class defining kwargs for defaults_fn.
                           Fields from this TypedDict become CLI arguments (--fn.<field-name>)
                           that are passed to defaults_fn(). Requires defaults_fn to be set.
+            script_path: Optional path to Python script for direct execution via nemo-run.
+                        When set, --run will execute this script directly without
+                        installing nemotron. Path is relative to package root (e.g.,
+                        "src/nemotron/recipes/nano3/stage0_pretrain/train.py").
+                        This is useful for training scripts that only depend on
+                        megatron-bridge, not nemotron.
 
         Example:
             >>> app.command(
@@ -314,7 +323,9 @@ class App:
         """
         if kwargs_schema is not None and defaults_fn is None:
             raise ValueError("kwargs_schema requires defaults_fn to be set")
-        self._commands.append((name, config, handler, description or config.__doc__ or "", artifacts, defaults_fn, kwargs_schema))
+        self._commands.append((name, config, handler, description or config.__doc__ or "", artifacts, defaults_fn, kwargs_schema, script_path))
+        if script_path is not None:
+            self._script_paths[name] = script_path
 
     def _build_union(
         self, include_global_options: bool = False
@@ -337,7 +348,7 @@ class App:
         union_members: list[type] = []
 
         # Add direct commands
-        for name, config, handler, desc, artifacts, defaults_fn, kwargs_schema in self._commands:
+        for name, config, handler, desc, artifacts, defaults_fn, kwargs_schema, _script_path in self._commands:
             if include_global_options:
                 # Create a wrapper that includes both config and global options
                 # Command config first, global options last (appears at bottom of help)
@@ -430,6 +441,30 @@ class App:
         annotated_union = Annotated[union_type, OmitArgPrefixes]  # type: ignore
         return annotated_union, handlers, artifacts_map, defaults_fn_map, kwargs_schema_map
 
+    def get_script_path(self, subcommand_parts: list[str]) -> str | None:
+        """Get the script path for a subcommand.
+
+        Args:
+            subcommand_parts: List of subcommand parts (e.g., ['pretrain'] or ['data', 'prep', 'pretrain'])
+
+        Returns:
+            Script path if the command has one, None otherwise.
+        """
+        if not subcommand_parts:
+            return None
+
+        first_part = subcommand_parts[0]
+
+        # Check direct commands
+        if first_part in self._script_paths and len(subcommand_parts) == 1:
+            return self._script_paths[first_part]
+
+        # Check nested groups
+        if first_part in self._groups:
+            return self._groups[first_part].get_script_path(subcommand_parts[1:])
+
+        return None
+
     def run(self) -> None:
         """Run the CLI application.
 
@@ -445,10 +480,10 @@ class App:
 
         args = sys.argv[1:]
 
-        # Check for --run and execute via nemo-run if specified
-        run_name, run_overrides, remaining_args = _extract_run_args(args)
+        # Check for --run/--launch and execute via nemo-run if specified
+        run_name, run_overrides, remaining_args, is_launch = _extract_run_args(args)
         if run_name is not None:
-            _execute_with_nemo_run(run_name, run_overrides, remaining_args)
+            _execute_with_nemo_run(run_name, run_overrides, remaining_args, is_launch, self)
             return
 
         # Read stdin artifacts if piped (for pipeline composition)
@@ -605,16 +640,21 @@ def _extract_fn_kwargs_from_artifacts(
     return fn_kwargs
 
 
-def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str]]:
-    """Extract --run and --run.<key> arguments.
+def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str], bool]:
+    """Extract --run/--launch and --run.<key>/--launch.<key> arguments.
 
     Args:
         args: Command line arguments
 
     Returns:
-        Tuple of (run_name, run_overrides, remaining_args)
+        Tuple of (run_name, run_overrides, remaining_args, is_launch).
+        is_launch is True when --launch was used (implies detach=True).
+
+    Raises:
+        ValueError: If both --run and --launch are specified.
     """
     run_name: str | None = None
+    launch_name: str | None = None
     run_overrides: dict[str, str] = {}
     remaining: list[str] = []
 
@@ -622,6 +662,7 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
     while i < len(args):
         arg = args[i]
 
+        # Handle --run / -r
         if arg == "--run" or arg == "-r":
             if i + 1 < len(args):
                 run_name = args[i + 1]
@@ -643,11 +684,70 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
         elif arg.startswith("-r="):
             run_name = arg[3:]
             i += 1
+        # Handle --launch / -l
+        elif arg == "--launch" or arg == "-l":
+            if i + 1 < len(args):
+                launch_name = args[i + 1]
+                i += 2
+            else:
+                remaining.append(arg)
+                i += 1
+        elif arg.startswith("--launch."):
+            key = arg[9:]  # Remove "--launch."
+            if i + 1 < len(args):
+                run_overrides[key] = args[i + 1]
+                i += 2
+            else:
+                remaining.append(arg)
+                i += 1
+        elif arg.startswith("--launch="):
+            launch_name = arg[9:]
+            i += 1
+        elif arg.startswith("-l="):
+            launch_name = arg[3:]
+            i += 1
         else:
             remaining.append(arg)
             i += 1
 
-    return run_name, run_overrides, remaining
+    # Validate mutual exclusivity
+    if run_name is not None and launch_name is not None:
+        raise ValueError("--run and --launch are mutually exclusive. Use --run for attached execution or --launch for detached execution.")
+
+    # Determine final name and whether launch mode is active
+    is_launch = launch_name is not None
+    final_name = launch_name if is_launch else run_name
+
+    return final_name, run_overrides, remaining, is_launch
+
+
+def _load_artifact_metadata_from_path(artifact_path: str) -> dict[str, Any] | None:
+    """Load artifact metadata from path.
+
+    Args:
+        artifact_path: Path to artifact directory or file.
+
+    Returns:
+        Artifact metadata dict, or None if not found.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(artifact_path)
+
+    # If path is a file (e.g., manifest.json, blend.json), use parent directory
+    if path.is_file():
+        metadata_path = path.parent / "metadata.json"
+    else:
+        metadata_path = path / "metadata.json"
+
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path) as f:
+        data = json.load(f)
+        # Metadata may be nested under "metadata" key or at top level
+        return data.get("metadata", data)
 
 
 def _apply_artifact_refs_to_config(
@@ -687,23 +787,34 @@ def _apply_artifact_refs_to_config(
         # Build the full art:// URI from the reference
         art_uri = _build_art_uri(ref, artifact_input.default_name)
 
+        # Resolve base artifact path once (for metadata loading)
+        base_artifact_path = resolve_artifact_uri(art_uri)
+
+        # Load metadata once if any mapping uses metadata. prefix
+        artifact_metadata = None
+        if any(f.startswith("metadata.") for f in artifact_input.mappings.keys()):
+            artifact_metadata = _load_artifact_metadata_from_path(base_artifact_path)
+
         # Apply each mapping (skip fn. prefixed targets - those are for defaults_fn)
         for artifact_field, config_field in artifact_input.mappings.items():
             # Skip fn. prefixed targets - those are handled by defaults_fn
             if config_field.startswith("fn."):
                 continue
 
-            # Build full URI with file path if specified
-            if artifact_field and not artifact_field.startswith("metadata."):
+            if artifact_field.startswith("metadata."):
+                # Extract value from artifact metadata
+                metadata_key = artifact_field[9:]  # Remove "metadata." prefix
+                if artifact_metadata and metadata_key in artifact_metadata:
+                    value = artifact_metadata[metadata_key]
+                    _set_nested_field(config, config_field, value, updates)
+            elif artifact_field:
+                # Build full URI with file path
                 full_uri = f"{art_uri}/{artifact_field}"
+                local_path = resolve_artifact_uri(full_uri)
+                _set_nested_field(config, config_field, local_path, updates)
             else:
-                full_uri = art_uri
-
-            # Resolve to local path
-            local_path = resolve_artifact_uri(full_uri)
-
-            # Set the config field (supports nested paths like "dataset.data_path")
-            _set_nested_field(config, config_field, local_path, updates)
+                # Use base artifact path
+                _set_nested_field(config, config_field, base_artifact_path, updates)
 
     # Process stdin artifacts (lower priority than --art.<name>)
     if stdin_artifacts:
@@ -719,17 +830,27 @@ def _apply_artifact_refs_to_config(
             artifact_path = artifact_info.get("path")
 
             if artifact_path:
+                # Load metadata once if any mapping uses metadata. prefix
+                artifact_metadata = None
+                if any(f.startswith("metadata.") for f in artifact_input.mappings.keys()):
+                    artifact_metadata = _load_artifact_metadata_from_path(artifact_path)
+
                 for artifact_field, config_field in artifact_input.mappings.items():
                     # Skip fn. prefixed targets - those are handled by defaults_fn
                     if config_field.startswith("fn."):
                         continue
 
-                    if artifact_field:
+                    if artifact_field.startswith("metadata."):
+                        # Extract value from artifact metadata
+                        metadata_key = artifact_field[9:]  # Remove "metadata." prefix
+                        if artifact_metadata and metadata_key in artifact_metadata:
+                            value = artifact_metadata[metadata_key]
+                            _set_nested_field(config, config_field, value, updates)
+                    elif artifact_field:
                         full_path = f"{artifact_path}/{artifact_field}"
+                        _set_nested_field(config, config_field, full_path, updates)
                     else:
-                        full_path = artifact_path
-
-                    _set_nested_field(config, config_field, full_path, updates)
+                        _set_nested_field(config, config_field, artifact_path, updates)
 
     # Apply updates to config using dataclass replace
     if updates:
@@ -860,18 +981,30 @@ def _append_wandb_args(args: list[str], wandb_config: WandbConfig) -> list[str]:
     return result
 
 
-def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_args: list[str]) -> None:
+def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_args: list[str], is_launch: bool = False, app: "App | None" = None) -> None:
     """Execute command via nemo-run with the specified profile.
 
     Args:
         run_name: Name of the run profile from run.toml
         overrides: Key-value overrides for the run profile
         remaining_args: Additional CLI arguments
+        is_launch: If True, force detach=True for detached execution
+        app: Optional App instance for looking up script paths
     """
-    from nemotron.kit.run import load_run_profile, load_wandb_config, build_executor, run_with_nemo_run
+    from nemotron.kit.run import load_run_profile, load_wandb_config, build_executor, run_with_nemo_run, resolve_partition
 
     # Load profile from run.toml
     profile = load_run_profile(run_name)
+
+    # Force detach=True and ray_mode="job" when using --launch
+    # ray_mode="job" ensures the cluster terminates after the job completes
+    if is_launch:
+        profile.detach = True
+        profile.ray_mode = "job"
+
+    # Resolve partition based on execution mode (run vs launch)
+    # This allows different partitions for attached vs detached execution
+    profile.partition = resolve_partition(profile, is_launch)
 
     # Load wandb config and append CLI args for remote execution
     wandb_config = load_wandb_config()
@@ -902,21 +1035,36 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
         subcommand_parts.append(arg)
     experiment_name = "-".join(subcommand_parts) if subcommand_parts else run_name
 
+    # Check if command has a direct script path (for commands that don't need pip install)
+    direct_script_path = app.get_script_path(subcommand_parts) if app else None
+
     # Check if target module has RAY = True
     use_ray = _check_module_ray_flag(subcommand_parts)
 
     if use_ray:
         # Use Ray execution path via run_with_nemo_run
-        # Build the command - need to include 'nano3' since it was stripped by __main__.py
-        # remaining_args is ['data', 'prep', 'pretrain', ...] but remote needs 'nano3' prefix
-        script_path = f"python -m nemotron nano3 {' '.join(remaining_args)}"
-        run_with_nemo_run(
-            script_path=script_path,
-            script_args=[],  # Args already included in script_path
-            run_config=profile,
-            ray=True,
-            pre_ray_start_commands=None,
-        )
+        if direct_script_path:
+            # Direct script execution - script path relative to /nemo_run/code
+            container_script_path = f"/nemo_run/code/{direct_script_path}"
+            script_args = remaining_args[len(subcommand_parts):]
+            run_with_nemo_run(
+                script_path=container_script_path,
+                script_args=script_args,
+                run_config=profile,
+                ray=True,
+                pre_ray_start_commands=None,
+            )
+        else:
+            # Fallback to module execution (requires pip install)
+            # Build the command - need to include 'nano3' since it was stripped by __main__.py
+            script_path = f"python -m nemotron nano3 {' '.join(remaining_args)}"
+            run_with_nemo_run(
+                script_path=script_path,
+                script_args=[],  # Args already included in script_path
+                run_config=profile,
+                ray=True,
+                pre_ray_start_commands=None,
+            )
     else:
         # Standard execution via nemo-run Experiment
         executor = build_executor(profile)
@@ -933,14 +1081,24 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
             # Inject experiment_id for artifact aliasing across tasks
             executor.env_vars["NEMO_EXPERIMENT_ID"] = exp._id
 
+            if not direct_script_path:
+                subcommand_str = " ".join(subcommand_parts)
+                raise ValueError(
+                    f"No script_path configured for command '{subcommand_str}'.\n"
+                    f"Add script_path parameter to app.command() in __main__.py."
+                )
+
+            # Direct script execution - no pip install needed
+            # Script only depends on megatron-bridge which is in the container
+            # Extract script args (everything after the subcommand)
+            script_args = remaining_args[len(subcommand_parts):]
+            # Script path is relative to /nemo_run/code
+            container_script_path = f"/nemo_run/code/{direct_script_path}"
+
             exp.add(
-                run.Script(
-                    path="nemotron",
-                    args=remaining_args,
-                    m=True,  # Use python -m nemotron instead of local script path
-                    entrypoint="python",
-                ),
+                run.Script(path=container_script_path, args=script_args, entrypoint="python"),
                 executor=executor,
+                name=experiment_name,
             )
             exp.run(detach=profile.detach)
 
@@ -1005,6 +1163,21 @@ def _subcommand_to_module(subcommand_parts: list[str]) -> str | None:
 
     elif len(parts) >= 2 and parts[0] == "train":
         stage = parts[1]  # e.g., "pretrain", "sft", "rl"
+
+        stage_map = {
+            "pretrain": "stage0_pretrain",
+            "sft": "stage1_sft",
+            "rl": "stage2_rl",
+        }
+        stage_dir = stage_map.get(stage)
+        if stage_dir is None:
+            return None
+
+        return f"nemotron.recipes.nano3.{stage_dir}.train"
+
+    elif len(parts) >= 1:
+        # Direct training commands: ['pretrain'], ['sft'], ['rl']
+        stage = parts[0]
 
         stage_map = {
             "pretrain": "stage0_pretrain",

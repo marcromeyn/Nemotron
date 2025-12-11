@@ -2,68 +2,89 @@
 """Pretrain script for Nemotron Nano3.
 
 Uses Megatron-Bridge's ConfigContainer for full training configuration.
-Model-specific defaults are loaded from nemotron_nano_v2 recipe.
+Uses the nemotron_next_3b_v2_pretrain_config recipe.
 
 Usage:
-    # Piped from data_prep (preferred for pipelines)
-    uv run -m nemotron.recipes.nano3.data_prep | \
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training
+    # Direct execution inside container (nemo-run, no nemotron package required)
+    python /path/to/train.py
 
-    # With explicit data path
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
-        --config.data.data-path /path/to/blend.json
+    # With YAML config file
+    python /path/to/train.py --config-file /path/to/pretrain.yaml
 
-    # With mock data for testing
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
-        --config.data.mock
+    # With CLI overrides (Hydra syntax)
+    python /path/to/train.py train.train_iters=5000 optimizer.lr=0.0003
 
-    # With kwargs_schema CLI args (e.g., --fn.seq-length, --fn.mock)
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
-        --fn.seq-length 4096 --fn.mock
+    # As module (requires nemotron package installed)
+    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.train
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import rich
-from nemotron.kit import cli, print_step_complete
-
 if TYPE_CHECKING:
     from megatron.bridge.training.config import ConfigContainer
 
 
 def main(config: ConfigContainer, data=None):
-    """Run Nano3 pretraining."""
+    """Run Nano3 pretraining.
+
+    Args:
+        config: ConfigContainer with full training configuration.
+        data: Optional data passed from pipeline (e.g., blend path info).
+    """
     from megatron.bridge.training.gpt_step import forward_step
     from megatron.bridge.training.pretrain import pretrain
 
-    # rich.print(config)
-
     model = pretrain(config=config, forward_step_func=forward_step)
-    print_step_complete(data=data, model=model)
+
+    # Only use print_step_complete if nemotron.kit is available (local dev)
+    try:
+        from nemotron.kit import print_step_complete
+
+        print_step_complete(data=data, model=model)
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":
-    # This requires: https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/liding/nm6_one_off
-    # Part of: nvcr.io/nvidian/nemo:25.11-nano-v3.rc1
-    from megatron.bridge.training.config import ConfigContainer
+    import argparse
+    import logging
+    import sys
+
+    from megatron.bridge.recipes.nemotronh import nemotron_next_3b_v2_pretrain_config
+    from megatron.bridge.training.utils.omegaconf_utils import process_config_with_overrides
+
+    logger = logging.getLogger(__name__)
+
+    def parse_args() -> tuple[argparse.Namespace, list[str]]:
+        """Parse command-line arguments."""
+        parser = argparse.ArgumentParser(
+            description="Pretrain script for Nemotron Nano3",
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        parser.add_argument(
+            "--config-file",
+            type=str,
+            default=None,
+            help="Path to YAML config file for overrides",
+        )
+
+        args, cli_overrides = parser.parse_known_args()
+        return args, cli_overrides
+
+    args, cli_overrides = parse_args()
+
+    config = nemotron_next_3b_v2_pretrain_config()
 
     try:
-        from megatron.bridge.recipes.nemotronh.nemotron_next_3b_v2 import (
-            nemotron_next_3b_v2_pretrain_config as nano_3_pretrain_config,
-            NemotronNext3Bv2CommonKwargs,
+        config = process_config_with_overrides(
+            config,
+            config_filepath=args.config_file,
+            cli_overrides=cli_overrides or None,
         )
-    except ImportError:
-        # Fallback to stub when megatron-bridge isn't available
-        from nemotron.recipes.nano3.stage0_pretrain.train_kwargs_stub import (
-            NemotronNext3Bv2CommonKwargs,
-        )
-        nano_3_pretrain_config = None
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
 
-    cli(
-        main,
-        defaults_fn=nano_3_pretrain_config,
-        kwargs_schema=NemotronNext3Bv2CommonKwargs,
-        parse_inputs={"data.blend_path": "fn.per_split_data_args_path"},
-    )
+    main(config)

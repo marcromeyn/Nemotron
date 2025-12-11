@@ -1,50 +1,81 @@
 #!/usr/bin/env python3
-"""Pretrain script for Nemotron Nano3.
+"""SFT (Supervised Fine-Tuning) script for Nemotron Nano3.
 
 Uses Megatron-Bridge's ConfigContainer for full training configuration.
-Model-specific defaults are loaded from nemotron_nano_v2 recipe.
+Uses the nemotron_nano_9b_v2_finetune_config recipe.
 
 Usage:
-    # Piped from data_prep (preferred for pipelines)
-    uv run -m nemotron.recipes.nano3.data_prep | \
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training
+    # Direct execution inside container (nemo-run, no nemotron package required)
+    python /path/to/train.py
 
-    # With explicit data path
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
-        --config.data.data-path /path/to/blend.json
+    # With YAML config file
+    python /path/to/train.py --config-file /path/to/sft.yaml
 
-    # With mock data for testing
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage0_pretrain.training \
-        --config.data.mock
+    # With CLI overrides (Hydra syntax)
+    python /path/to/train.py train.train_iters=5000 optimizer.lr=0.0001
+
+    # As module (requires nemotron package installed)
+    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage1_sft.train
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import rich
-from nemotron.kit import cli
-
 if TYPE_CHECKING:
     from megatron.bridge.training.config import ConfigContainer
 
 
 def main(config: ConfigContainer):
-    """Run Nano3 pretraining."""
-    from megatron.bridge.training.gpt_step import forward_step
+    """Run Nano3 supervised fine-tuning.
+
+    Args:
+        config: ConfigContainer with full training configuration.
+    """
     from megatron.bridge.training.finetune import finetune
+    from megatron.bridge.training.gpt_step import forward_step
 
-    rich.print(config)
-
-    # return finetune(config=config, forward_step_func=forward_step)
+    finetune(config=config, forward_step_func=forward_step)
 
 
 if __name__ == "__main__":
-    from megatron.bridge.training.config import ConfigContainer
-    from megatron.bridge.recipes.nemotronh.nemotron_nano_v2 import nemotron_nano_v2
+    import argparse
+    import logging
+    import sys
 
-    cli(
-        main,
-        defaults=nemotron_nano_v2,
-        parse_inputs={"data.blend_path": "config.data.data_path"},
-    )
+    from megatron.bridge.recipes.nemotronh import nemotron_nano_9b_v2_finetune_config
+    from megatron.bridge.training.utils.omegaconf_utils import process_config_with_overrides
+
+    logger = logging.getLogger(__name__)
+
+    def parse_args() -> tuple[argparse.Namespace, list[str]]:
+        """Parse command-line arguments."""
+        parser = argparse.ArgumentParser(
+            description="SFT script for Nemotron Nano3",
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        parser.add_argument(
+            "--config-file",
+            type=str,
+            default=None,
+            help="Path to YAML config file for overrides",
+        )
+
+        args, cli_overrides = parser.parse_known_args()
+        return args, cli_overrides
+
+    args, cli_overrides = parse_args()
+
+    config = nemotron_nano_9b_v2_finetune_config()
+
+    try:
+        config = process_config_with_overrides(
+            config,
+            config_filepath=args.config_file,
+            cli_overrides=cli_overrides or None,
+        )
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    main(config)

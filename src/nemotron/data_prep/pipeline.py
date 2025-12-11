@@ -374,14 +374,12 @@ def _distribute_shards_to_splits(
     num_shards: int,
     valid_shards: int = 1,
     test_shards: int = 1,
+    seed: int = 42,
 ) -> dict[str, list[str]]:
     """Distribute shard paths into train/valid/test splits.
 
-    Assigns the last shards to validation and test, with the remainder going
-    to train. Specifically:
-    - test: last `test_shards` shard(s)
-    - valid: previous `valid_shards` shard(s)
-    - train: all remaining shards
+    Collects all shards from all datasets into a pool, then randomly selects
+    shards for test and valid splits. The remaining shards go to train.
 
     The data_paths format is: ["weight", "path", "weight", "path", ...]
     where paths are shard prefixes (e.g., /path/to/shard).
@@ -392,12 +390,15 @@ def _distribute_shards_to_splits(
     Args:
         data_paths: Megatron-Bridge format path list ["weight", "path", ...]
         num_shards: Total number of shards per dataset
-        valid_shards: Number of shards for validation
-        test_shards: Number of shards for test
+        valid_shards: Number of shards for validation (total, not per-dataset)
+        test_shards: Number of shards for test (total, not per-dataset)
+        seed: Random seed for reproducible shard selection
 
     Returns:
         Dict with "train", "valid", "test" keys containing data_paths lists
     """
+    import random
+
     # Parse weight/path pairs from data_paths
     # Format: ["1.0", "/path/dataset1/shard", "0.5", "/path/dataset2/shard", ...]
     pairs = []
@@ -407,49 +408,43 @@ def _distribute_shards_to_splits(
             prefix = data_paths[i + 1]
             pairs.append((weight, prefix))
 
-    # Calculate shard distribution
-    # test gets the last `test_shards` shards
-    # valid gets the previous `valid_shards` shards
-    # train gets all remaining shards
-    total_reserved = valid_shards + test_shards
-    if total_reserved >= num_shards:
-        # Not enough shards - give at least 1 to each split
-        train_end = max(1, num_shards - 2)
-        valid_start = train_end
-        valid_end = min(train_end + 1, num_shards - 1)
-        test_start = valid_end
-    else:
-        train_end = num_shards - total_reserved
-        valid_start = train_end
-        valid_end = train_end + valid_shards
-        test_start = valid_end
-
-    # Build split-specific data_paths lists
-    # Each split gets specific shard file paths (with _XXXX suffix)
-    train_paths: list[str] = []
-    valid_paths: list[str] = []
-    test_paths: list[str] = []
-
+    # Collect ALL shards from ALL datasets into one pool
+    # Each entry is (weight, shard_path) where shard_path has the _XXXX suffix
+    all_shards: list[tuple[str, str]] = []
     for weight, prefix in pairs:
-        # Train shards: 0 to train_end-1
-        for shard_idx in range(train_end):
-            train_paths.append(weight)
-            train_paths.append(f"{prefix}_{shard_idx:04d}")
+        for shard_idx in range(num_shards):
+            all_shards.append((weight, f"{prefix}_{shard_idx:04d}"))
 
-        # Valid shards: valid_start to valid_end-1
-        for shard_idx in range(valid_start, valid_end):
-            valid_paths.append(weight)
-            valid_paths.append(f"{prefix}_{shard_idx:04d}")
+    # Use seeded RNG for reproducibility
+    rng = random.Random(seed)
 
-        # Test shards: test_start to num_shards-1
-        for shard_idx in range(test_start, num_shards):
-            test_paths.append(weight)
-            test_paths.append(f"{prefix}_{shard_idx:04d}")
+    # Randomly select shards for test and valid
+    # Ensure we don't request more shards than available
+    total_shards = len(all_shards)
+    actual_test_shards = min(test_shards, total_shards)
+    remaining_after_test = total_shards - actual_test_shards
+    actual_valid_shards = min(valid_shards, remaining_after_test)
+
+    # Shuffle and partition
+    shuffled = all_shards.copy()
+    rng.shuffle(shuffled)
+
+    test_selection = shuffled[:actual_test_shards]
+    valid_selection = shuffled[actual_test_shards : actual_test_shards + actual_valid_shards]
+    train_selection = shuffled[actual_test_shards + actual_valid_shards :]
+
+    # Convert back to flat list format ["weight", "path", "weight", "path", ...]
+    def flatten(shard_pairs: list[tuple[str, str]]) -> list[str]:
+        result: list[str] = []
+        for weight, path in shard_pairs:
+            result.append(weight)
+            result.append(path)
+        return result
 
     return {
-        "train": train_paths,
-        "valid": valid_paths,
-        "test": test_paths,
+        "train": flatten(train_selection),
+        "valid": flatten(valid_selection),
+        "test": flatten(test_selection),
     }
 
 

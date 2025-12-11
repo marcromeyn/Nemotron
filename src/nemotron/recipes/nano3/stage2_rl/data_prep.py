@@ -30,7 +30,7 @@ from nemotron.data_prep import (
 from nemotron.data_prep.config import DatasetConfig, JsonlOutputConfig
 from nemotron.data_prep.discovery import get_dataset_metadata
 from nemotron.data_prep.formats.transforms import nemotron_rl
-from nemotron.kit import DataBlendsArtifact, cli, print_step_complete
+from nemotron.kit import SplitJsonlDataArtifact, cli, print_step_complete
 from nemotron.kit.trackers import InputDatasetInfo
 from nemotron.kit.wandb import add_wandb_tags, finish_wandb
 
@@ -99,7 +99,7 @@ def _run_single_blend(
     cfg: RLDataPrepConfig,
     num_actors: int,
     source_datasets: list[InputDatasetInfo],
-) -> DataBlendsArtifact:
+) -> SplitJsonlDataArtifact:
     """Process blend without train/val/test splitting."""
     # Build pipeline config with JSONL output format
     format_config = JsonlOutputConfig(
@@ -122,13 +122,12 @@ def _run_single_blend(
     result = last_mile_process(blend, pipeline_config)
 
     # Build output artifact with source datasets for lineage tracking
-    artifact = DataBlendsArtifact(
+    # Using SplitJsonlDataArtifact since JSONL doesn't tokenize
+    artifact = SplitJsonlDataArtifact(
         path=result.blend_path,
-        total_tokens=result.total_tokens,
         total_sequences=result.total_sequences,
         elapsed_sec=result.elapsed_sec,
         source_datasets=source_datasets,
-        # No tokenizer for RL (JSONL format)
     )
     return artifact
 
@@ -138,7 +137,7 @@ def _run_split_blend(
     cfg: RLDataPrepConfig,
     num_actors: int,
     source_datasets: list[InputDatasetInfo],
-) -> DataBlendsArtifact:
+) -> SplitJsonlDataArtifact:
     """Process blend with train/val/test splitting.
 
     Creates separate output directories for train, val, and test splits.
@@ -217,18 +216,27 @@ def _run_split_blend(
     elapsed = time.time() - start_time
 
     # Return artifact pointing to manifest with source datasets for lineage
-    artifact = DataBlendsArtifact(
+    # Using SplitJsonlDataArtifact since JSONL doesn't tokenize
+    artifact = SplitJsonlDataArtifact(
         path=manifest_path,
-        total_tokens=0,
         total_sequences=total_sequences,
         elapsed_sec=elapsed,
         source_datasets=source_datasets,
-        # No tokenizer for RL (JSONL format)
     )
+
+    # Add train/val paths directly to metadata for artifact resolution
+    # These are used by the rl training command via artifact mappings
+    if "train" in split_paths:
+        artifact.metadata["train"] = str(split_paths["train"])
+    if "val" in split_paths:
+        artifact.metadata["val"] = str(split_paths["val"])
+    if "test" in split_paths:
+        artifact.metadata["test"] = str(split_paths["test"])
+
     return artifact
 
 
-def main(cfg: RLDataPrepConfig) -> DataBlendsArtifact:
+def main(cfg: RLDataPrepConfig) -> SplitJsonlDataArtifact:
     """Run RL data preparation."""
     # Add stage-specific tags to wandb run
     add_wandb_tags(["data-prep", "rl"])

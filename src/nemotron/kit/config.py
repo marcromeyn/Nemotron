@@ -772,8 +772,8 @@ def cli(
     if args is None:
         args = sys.argv[1:]
 
-    # Check for --run <profile> and handle nemo-run execution
-    run_name, run_overrides, remaining_args = _extract_run_args(args)
+    # Check for --run/--launch <profile> and handle nemo-run execution
+    run_name, run_overrides, remaining_args, is_launch = _extract_run_args(args)
     if run_name is not None:
         return _execute_with_nemo_run(
             run_name=run_name,
@@ -781,6 +781,7 @@ def cli(
             script_args=remaining_args,
             ray=ray,
             pre_ray_start_commands=pre_ray_start_commands,
+            is_launch=is_launch,
         )
 
     # Validate kwargs_schema requires defaults_fn
@@ -936,20 +937,27 @@ def _func_to_dataclass(func: Callable) -> Type | None:
     return make_dataclass(f"{func.__name__}_Config", dc_fields)
 
 
-def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str]]:
-    """Extract --run arguments from CLI args.
+def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str], bool]:
+    """Extract --run/--launch arguments from CLI args.
 
     Parses --run <profile> and --run.<key> <value> overrides from args,
-    returning the profile name, overrides dict, and remaining args.
+    or --launch <profile> and --launch.<key> <value> overrides.
+    Returns the profile name, overrides dict, remaining args, and whether
+    launch mode (detached execution) was used.
 
     Args:
         args: Original CLI arguments.
 
     Returns:
-        Tuple of (profile_name, overrides_dict, remaining_args).
-        profile_name is None if --run not specified.
+        Tuple of (profile_name, overrides_dict, remaining_args, is_launch).
+        profile_name is None if neither --run nor --launch specified.
+        is_launch is True when --launch was used (implies detach=True).
+
+    Raises:
+        ValueError: If both --run and --launch are specified.
     """
     run_name: str | None = None
+    launch_name: str | None = None
     run_overrides: dict[str, str] = {}
     remaining: list[str] = []
 
@@ -987,10 +995,53 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
             i += 1
             continue
 
+        # Handle --launch / -l <profile>
+        if arg == "--launch" or arg == "-l":
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                launch_name = args[i + 1]
+                i += 2
+                continue
+            else:
+                raise ValueError("--launch requires a profile name")
+
+        # Handle --launch=<profile> or -l=<profile>
+        if arg.startswith("--launch="):
+            launch_name = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        if arg.startswith("-l="):
+            launch_name = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        # Handle --launch.<key> <value> or --launch.<key>=<value>
+        if arg.startswith("--launch."):
+            key = arg[9:]  # Remove "--launch."
+            if "=" in key:
+                key, value = key.split("=", 1)
+                run_overrides[key] = value
+            elif i + 1 < len(args):
+                run_overrides[key] = args[i + 1]
+                i += 2
+                continue
+            else:
+                raise ValueError(f"--launch.{key} requires a value")
+            i += 1
+            continue
+
         remaining.append(arg)
         i += 1
 
-    return run_name, run_overrides, remaining
+    # Validate mutual exclusivity
+    if run_name is not None and launch_name is not None:
+        raise ValueError("--run and --launch are mutually exclusive. Use --run for attached execution or --launch for detached execution.")
+
+    # Determine final name and whether launch mode is active
+    is_launch = launch_name is not None
+    final_name = launch_name if is_launch else run_name
+
+    return final_name, run_overrides, remaining, is_launch
 
 
 def _execute_with_nemo_run(
@@ -999,6 +1050,7 @@ def _execute_with_nemo_run(
     script_args: list[str],
     ray: bool,
     pre_ray_start_commands: list[str] | None,
+    is_launch: bool = False,
 ) -> None:
     """Execute the current script via nemo-run.
 
@@ -1008,6 +1060,7 @@ def _execute_with_nemo_run(
         script_args: Arguments to pass to the script.
         ray: Whether to use Ray execution.
         pre_ray_start_commands: Commands to run before Ray starts.
+        is_launch: If True, force detach=True for detached execution.
 
     Raises:
         SystemExit: After nemo-run execution completes.
@@ -1016,6 +1069,12 @@ def _execute_with_nemo_run(
 
     # Load and apply overrides to run config
     run_config = load_run_profile(run_name)
+
+    # Force detach=True and ray_mode="job" when using --launch
+    # ray_mode="job" ensures the cluster terminates after the job completes
+    if is_launch:
+        run_config.detach = True
+        run_config.ray_mode = "job"
 
     # Apply CLI overrides
     for key, value in run_overrides.items():

@@ -30,6 +30,7 @@ Wandb configuration can also be stored in run.toml:
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -58,6 +59,8 @@ class RunConfig:
 
         account: Slurm account name
         partition: Slurm partition name
+        run_partition: Partition to use for attached execution (--run), overrides partition
+        launch_partition: Partition to use for detached execution (--launch), overrides partition
         time: Slurm job time limit (HH:MM:SS)
         job_name: Slurm job name
         ntasks_per_node: Slurm tasks per node
@@ -113,6 +116,8 @@ class RunConfig:
     # Slurm settings
     account: str | None = None
     partition: str | None = None
+    run_partition: str | None = None
+    launch_partition: str | None = None
     time: str = "04:00:00"
     job_name: str = "nemo-run"
     ntasks_per_node: int | None = None
@@ -160,6 +165,35 @@ class RunConfig:
     # Execution options
     dry_run: bool = False
     detach: bool = False
+
+
+def resolve_partition(config: RunConfig, is_launch: bool) -> str | None:
+    """Resolve the effective partition based on execution mode.
+
+    Selects the appropriate partition based on whether the job is being
+    launched (detached) or run (attached):
+    - For --launch (detached): use launch_partition if defined, else partition
+    - For --run (attached): use run_partition if defined, else partition
+
+    Args:
+        config: RunConfig with partition settings.
+        is_launch: True for detached execution (--launch), False for attached (--run).
+
+    Returns:
+        The effective partition name, or None if no partition is configured.
+
+    Example:
+        >>> config = RunConfig(partition="batch", launch_partition="interactive")
+        >>> resolve_partition(config, is_launch=False)
+        'batch'
+        >>> resolve_partition(config, is_launch=True)
+        'interactive'
+    """
+    if is_launch and config.launch_partition is not None:
+        return config.launch_partition
+    if not is_launch and config.run_partition is not None:
+        return config.run_partition
+    return config.partition
 
 
 def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) -> Any:
@@ -506,6 +540,28 @@ def load_run_profile(name: str, config_path: Path | None = None) -> RunConfig:
     return _resolve_profile(name, all_profiles, seen=set())
 
 
+def list_run_profiles(config_path: Path | None = None) -> list[str]:
+    """List available run profiles from run config.
+
+    Profiles are top-level sections in run.toml/yaml/json, excluding the special
+    [wandb] section.
+
+    Args:
+        config_path: Optional explicit path to config file.
+
+    Returns:
+        Sorted list of profile names.
+    """
+    if config_path is None:
+        config_path = _find_run_config()
+    if config_path is None:
+        return []
+
+    sections = _load_config_file(config_path)
+    profiles = [k for k in sections.keys() if k != "wandb"]
+    return sorted(profiles)
+
+
 def load_wandb_config(config_path: Path | None = None) -> "WandbConfig | None":
     """Load wandb configuration from run.toml [wandb] section.
 
@@ -599,8 +655,11 @@ def run_with_nemo_run(
         import yaml
 
         # Recipe requires Ray - use RayJob
-        # Generate job name from script path or config
-        job_name = run_config.job_name or Path(script_path).stem
+        # Generate unique job name to prevent directory collisions
+        # nemo-run's SlurmRayJob uses cluster_dir = tunnel.job_dir + name,
+        # so jobs with the same name would overwrite each other's directories
+        base_name = run_config.job_name or Path(script_path).stem
+        job_name = f"{base_name}_{int(time.time())}"
         ray_job = RayJob(name=job_name, executor=executor)
 
         # Log the ray mode
@@ -615,16 +674,27 @@ def run_with_nemo_run(
             log_file = f"{run_config.remote_job_dir}/{job_name}/logs/ray-job.log"
             log_clear_cmd = f": > {log_file} 2>/dev/null || true"
 
-        # Sync the project on each node before Ray starts
-        # This ensures Ray and the nemotron package are available to all workers
-        # Use --reinstall-package to force update the local editable package
-        # and clear __pycache__ to avoid stale bytecode
-        # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
-        # Note: uv is already available in the container image
-        setup_commands = [
-            "find . -type d -name __pycache__ -delete 2>/dev/null || true",
-            "uv sync --reinstall-package nemotron",
-        ]
+        # Check if this is a direct script path (container path, no nemotron install needed)
+        is_direct_script = script_path.startswith("/nemo_run/code/")
+
+        if is_direct_script:
+            # Direct script execution - no uv sync needed
+            # Script only depends on packages already in the container (e.g., nemo-rl)
+            setup_commands = [
+                "find . -type d -name __pycache__ -delete 2>/dev/null || true",
+            ]
+        else:
+            # Module execution - sync nemotron package
+            # This ensures Ray and the nemotron package are available to all workers
+            # Use --reinstall-package to force update the local editable package
+            # and clear __pycache__ to avoid stale bytecode
+            # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
+            # Note: uv is already available in the container image
+            setup_commands = [
+                "find . -type d -name __pycache__ -delete 2>/dev/null || true",
+                "uv sync --reinstall-package nemotron",
+            ]
+
         # Prepend log clearing if remote_job_dir is configured
         if log_clear_cmd:
             setup_commands.insert(0, log_clear_cmd)
@@ -636,17 +706,23 @@ def run_with_nemo_run(
                 if cmd not in pre_ray_start_commands:
                     pre_ray_start_commands = [cmd] + pre_ray_start_commands
 
-        # Use uv run to execute script with proper project environment
-        # Prepend cache cleanup and reinstall to ensure fresh code on each job
-        # This handles the case where Ray cluster is reused across code changes
-        # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
-        cmd = (
-            "find . -type d -name __pycache__ -delete 2>/dev/null || true && "
-            "uv sync --reinstall-package nemotron && "
-            f"uv run {script_path}"
-        )
-        if script_args:
-            cmd += " " + " ".join(script_args)
+        if is_direct_script:
+            # Direct script execution - run python directly
+            cmd = f"python {script_path}"
+            if script_args:
+                cmd += " " + " ".join(script_args)
+        else:
+            # Use uv run to execute script with proper project environment
+            # Prepend cache cleanup and reinstall to ensure fresh code on each job
+            # This handles the case where Ray cluster is reused across code changes
+            # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
+            cmd = (
+                "find . -type d -name __pycache__ -delete 2>/dev/null || true && "
+                "uv sync --reinstall-package nemotron && "
+                f"uv run {script_path}"
+            )
+            if script_args:
+                cmd += " " + " ".join(script_args)
 
         # Build runtime_env with environment variables for Ray workers
         # This ensures env vars like HF_TOKEN are available in Ray tasks/actors
@@ -687,29 +763,21 @@ def run_with_nemo_run(
             pre_ray_start_commands=pre_ray_start_commands,
             runtime_env_yaml=runtime_env_yaml,
         )
+
+        # Workaround for nemo-run bug: when reusing an existing cluster,
+        # SlurmRayCluster.create() returns None instead of the job_id.
+        # Fix by querying the backend status which has the actual job_id.
+        if ray_job.backend.job_id is None:
+            status = ray_job.backend.status(display=False)
+            if status and status.get("job_id"):
+                ray_job.backend.job_id = status["job_id"]
+                sys.stderr.write(
+                    f"[info] Recovered job_id {status['job_id']} from cluster status\n"
+                )
+
         if not run_config.detach:
             try:
-                # Workaround for nemo-run bug: when reusing an existing cluster,
-                # SlurmRayCluster.create() returns None instead of the job_id.
-                # The logs() method then fails because job_ids.json may not exist yet.
-                # Retry a few times to give the cluster time to write job_ids.json.
-                import time
-
-                max_retries = 6
-                retry_delay = 5
-                for attempt in range(max_retries):
-                    try:
-                        ray_job.logs(follow=True)
-                        break
-                    except RuntimeError as e:
-                        if "has no job_id" in str(e) and attempt < max_retries - 1:
-                            sys.stderr.write(
-                                f"[info] Waiting for job_id to become available "
-                                f"(attempt {attempt + 1}/{max_retries})...\n"
-                            )
-                            time.sleep(retry_delay)
-                        else:
-                            raise
+                ray_job.logs(follow=True)
             except KeyboardInterrupt:
                 if run_config.ray_mode == "cluster":
                     # In cluster mode, keep the cluster running for subsequent jobs

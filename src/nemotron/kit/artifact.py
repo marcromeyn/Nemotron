@@ -351,6 +351,11 @@ class DataBlendsArtifact(Artifact):
     total_sequences: Annotated[int, Field(ge=0, description="Total documents processed")]
     elapsed_sec: Annotated[float, Field(default=0.0, ge=0, description="Processing time in seconds")]
 
+    # Per-split token counts (optional, populated in per-split mode)
+    train_tokens: Annotated[int | None, Field(default=None, ge=0, description="Tokens in train split")]
+    valid_tokens: Annotated[int | None, Field(default=None, ge=0, description="Tokens in valid split")]
+    test_tokens: Annotated[int | None, Field(default=None, ge=0, description="Tokens in test split")]
+
     # Source datasets for lineage tracking
     # Accepts InputDatasetInfo (with metadata) or str (URI only, for backwards compat)
     source_datasets: Annotated[
@@ -412,6 +417,85 @@ class DataBlendsArtifact(Artifact):
             if is_initialized():
                 config = get_config()
                 # Skip registry publish for wandb backend - WandbTracker already logged it
+                if config and config.backend != "wandb":
+                    registry = get_registry()
+                    artifact_name = name or self.type
+                    version = registry.publish(artifact_name, output_dir, metadata=self.metadata)
+                    self._name = artifact_name
+                    self._version = version.version
+        except ImportError:
+            pass
+
+
+class SplitJsonlDataArtifact(Artifact):
+    """Split JSONL data artifact (output of non-tokenized data_prep).
+
+    Used for RL and other stages that output JSONL files without tokenization.
+    The path points directly to the manifest.json file.
+
+    Unlike DataBlendsArtifact, this does not track token counts since the
+    data is not tokenized.
+
+    Source URIs are tracked for W&B lineage:
+    - source_datasets: Input datasets with metadata (or URIs for backwards compat)
+    """
+
+    total_sequences: Annotated[int, Field(ge=0, description="Total documents processed")]
+    elapsed_sec: Annotated[float, Field(default=0.0, ge=0, description="Processing time in seconds")]
+
+    # Source datasets for lineage tracking
+    source_datasets: Annotated[
+        list[InputDatasetInfo | str],
+        Field(default_factory=list, description="Input datasets with metadata"),
+    ]
+
+    def save(self, name: str | None = None) -> None:
+        """Save artifact metadata to path's parent directory.
+
+        Since SplitJsonlDataArtifact.path points to manifest.json (a file),
+        metadata.json is written to the same directory.
+        """
+        # Use parent directory since self.path is a file (blend.json/manifest.json)
+        output_dir = self.path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get tracker if active
+        tracker = get_lineage_tracker()
+        if tracker and tracker.is_active():
+            if self.producer is None:
+                self.producer = tracker.get_run_id() or "local"
+
+            # Derive artifact name from semantic name if set
+            artifact_name = name
+            if artifact_name is None and self.name:
+                parts = self.name.split("/")
+                if len(parts) >= 2:
+                    stage = parts[1].split("?")[0]
+                    artifact_name = f"{self.type}-{stage}"
+            artifact_name = artifact_name or self.type
+
+            tracking_metadata = tracker.log_artifact(self, artifact_name, self._used_artifacts)
+            self.tracking = TrackingInfo(**tracking_metadata)
+        else:
+            if self.producer is None:
+                self.producer = "local"
+
+        # Write metadata.json atomically in the parent directory
+        metadata_path = output_dir / "metadata.json"
+        temp_path = output_dir / ".metadata.json.tmp"
+
+        with open(temp_path, "w") as f:
+            json.dump(self.model_dump(mode="json"), f, indent=2, default=str)
+
+        temp_path.rename(metadata_path)
+
+        # Publish to registry if initialized
+        try:
+            from nemotron.kit import get_config, is_initialized
+            from nemotron.kit.registry import get_registry
+
+            if is_initialized():
+                config = get_config()
                 if config and config.backend != "wandb":
                     registry = get_registry()
                     artifact_name = name or self.type

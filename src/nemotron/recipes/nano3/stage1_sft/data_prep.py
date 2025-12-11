@@ -181,12 +181,20 @@ def main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
     # Create tokenizer URI for lineage tracking
     tok_uri = tokenizer_to_uri(cfg.tokenizer_model)
 
+    # Extract per-split token counts from result.splits
+    train_tokens = result.splits["train"].total_tokens if "train" in result.splits else None
+    valid_tokens = result.splits["valid"].total_tokens if "valid" in result.splits else None
+    test_tokens = result.splits["test"].total_tokens if "test" in result.splits else None
+
     # Build output artifact
     artifact = DataBlendsArtifact(
         path=result.blend_path,
         total_tokens=result.total_tokens,
         total_sequences=result.total_sequences,
         elapsed_sec=result.elapsed_sec,
+        train_tokens=train_tokens,
+        valid_tokens=valid_tokens,
+        test_tokens=test_tokens,
         source_datasets=source_datasets,
         tokenizer_uri=tok_uri,
     )
