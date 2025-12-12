@@ -772,7 +772,7 @@ def cli(
     if args is None:
         args = sys.argv[1:]
 
-    # Check for --run/--launch <profile> and handle nemo-run execution
+    # Check for --run/--batch <profile> and handle nemo-run execution
     run_name, run_overrides, remaining_args, is_launch = _extract_run_args(args)
     if run_name is not None:
         return _execute_with_nemo_run(
@@ -938,23 +938,23 @@ def _func_to_dataclass(func: Callable) -> Type | None:
 
 
 def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str], bool]:
-    """Extract --run/--launch arguments from CLI args.
+    """Extract --run/--batch arguments from CLI args.
 
     Parses --run <profile> and --run.<key> <value> overrides from args,
-    or --launch <profile> and --launch.<key> <value> overrides.
+    or --batch <profile> and --batch.<key> <value> overrides.
     Returns the profile name, overrides dict, remaining args, and whether
-    launch mode (detached execution) was used.
+    batch mode (detached execution) was used.
 
     Args:
         args: Original CLI arguments.
 
     Returns:
         Tuple of (profile_name, overrides_dict, remaining_args, is_launch).
-        profile_name is None if neither --run nor --launch specified.
-        is_launch is True when --launch was used (implies detach=True).
+        profile_name is None if neither --run nor --batch specified.
+        is_launch is True when --batch was used (implies detach=True).
 
     Raises:
-        ValueError: If both --run and --launch are specified.
+        ValueError: If both --run and --batch are specified.
     """
     run_name: str | None = None
     launch_name: str | None = None
@@ -995,29 +995,29 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
             i += 1
             continue
 
-        # Handle --launch / -l <profile>
-        if arg == "--launch" or arg == "-l":
+        # Handle --batch / -b <profile>
+        if arg == "--batch" or arg == "-b":
             if i + 1 < len(args) and not args[i + 1].startswith("--"):
                 launch_name = args[i + 1]
                 i += 2
                 continue
             else:
-                raise ValueError("--launch requires a profile name")
+                raise ValueError("--batch requires a profile name")
 
-        # Handle --launch=<profile> or -l=<profile>
-        if arg.startswith("--launch="):
+        # Handle --batch=<profile> or -b=<profile>
+        if arg.startswith("--batch="):
             launch_name = arg.split("=", 1)[1]
             i += 1
             continue
 
-        if arg.startswith("-l="):
+        if arg.startswith("-b="):
             launch_name = arg.split("=", 1)[1]
             i += 1
             continue
 
-        # Handle --launch.<key> <value> or --launch.<key>=<value>
-        if arg.startswith("--launch."):
-            key = arg[9:]  # Remove "--launch."
+        # Handle --batch.<key> <value> or --batch.<key>=<value>
+        if arg.startswith("--batch."):
+            key = arg[8:]  # Remove "--batch."
             if "=" in key:
                 key, value = key.split("=", 1)
                 run_overrides[key] = value
@@ -1026,7 +1026,7 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
                 i += 2
                 continue
             else:
-                raise ValueError(f"--launch.{key} requires a value")
+                raise ValueError(f"--batch.{key} requires a value")
             i += 1
             continue
 
@@ -1035,9 +1035,9 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
 
     # Validate mutual exclusivity
     if run_name is not None and launch_name is not None:
-        raise ValueError("--run and --launch are mutually exclusive. Use --run for attached execution or --launch for detached execution.")
+        raise ValueError("--run and --batch are mutually exclusive. Use --run for attached execution or --batch for detached execution.")
 
-    # Determine final name and whether launch mode is active
+    # Determine final name and whether batch mode is active
     is_launch = launch_name is not None
     final_name = launch_name if is_launch else run_name
 
@@ -1070,7 +1070,7 @@ def _execute_with_nemo_run(
     # Load and apply overrides to run config
     run_config = load_run_profile(run_name)
 
-    # Force detach=True and ray_mode="job" when using --launch
+    # Force detach=True and ray_mode="job" when using --batch
     # ray_mode="job" ensures the cluster terminates after the job completes
     if is_launch:
         run_config.detach = True

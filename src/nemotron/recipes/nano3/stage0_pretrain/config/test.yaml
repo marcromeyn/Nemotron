@@ -1,0 +1,29 @@
+run:
+  data: DataBlendsArtifact-pretrain
+  model: ModelArtifact-pretrain
+  env:
+    container: nvcr.io/nvidian/nemo:25.11-nano-v3.rc2
+  wandb:
+    project: nemotron
+    entity: romeyn
+
+
+recipe:
+  per_split_data_args_path: ${art.data.path}
+
+
+train:
+  train_iters: 1000
+  global_batch_size: 32
+
+model:
+  pipeline_model_parallel_size: 2
+
+scheduler:
+  lr_warmup_iters: 32
+
+logger:
+  log_interval: 10
+
+checkpoint:
+  save: null

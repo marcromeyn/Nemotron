@@ -1,4 +1,4 @@
-"""Stub for Nemotron Next 3B v2 kwargs TypedDict.
+"""Stub for Nemotron 3 Nano kwargs TypedDict.
 
 Provides a lightweight TypedDict for local CLI development
 when megatron-bridge isn't installed (requires CUDA to build).
@@ -28,18 +28,18 @@ class CommOverlapConfig:
 
 
 # Provider literal type
-NemotronNanoNext3Bv2Provider = Literal["local", "nemo", "te"]
+Nemotron3NanoProvider = Literal["local", "nemo", "te"]
 
 
-class NemotronNext3Bv2CommonKwargs(TypedDict, total=False):
-    """Typed options accepted by Nemotron Next 3B v2 recipe helper functions.
+class Nemotron3NanoCommonKwargs(TypedDict, total=False):
+    """Typed options accepted by Nemotron 3 Nano recipe helper functions.
 
     This TypedDict defines all the keyword arguments that can be passed to
-    the nemotron_next_3b_v2_pretrain_config() recipe function.
+    the nemotron_3_nano_pretrain_config() recipe function.
     """
 
     # Core identifiers
-    model_provider: NemotronNanoNext3Bv2Provider
+    model_provider: Nemotron3NanoProvider
     dir: Optional[str]
     name: str
 

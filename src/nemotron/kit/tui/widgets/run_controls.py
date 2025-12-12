@@ -10,7 +10,7 @@ from nemotron.kit.run import list_run_profiles
 
 class RunControls(Container):
     DEFAULT_CSS = """\
-    RunControls Select { width: 24; }
+    RunControls Select { width: 30; }
     """
 
     class RunRequested(Message):

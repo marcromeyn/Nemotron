@@ -155,7 +155,7 @@ app.command(
     artifacts={
         "data": ArtifactInput(
             default_name="DataBlendsArtifact-pretrain",
-            mappings={"path": "data.data_path"},
+            mappings={"path": "fn.per_split_data_args_path"},
         ),
     },
     script_path="src/nemotron/recipes/nano3/stage0_pretrain/train.py",

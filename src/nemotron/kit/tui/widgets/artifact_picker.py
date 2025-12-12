@@ -7,7 +7,7 @@ from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Collapsible, Input, Select, Static
 
 from nemotron.kit.artifact import ArtifactInput
@@ -24,7 +24,7 @@ class ArtifactSlotState:
     wb_type: str | None = None
 
 
-class ArtifactPicker(Container):
+class ArtifactPicker(VerticalScroll):
     """Collects artifact references for App-style artifact slots.
 
     This produces a mapping suitable for nemotron.kit.app._apply_artifact_refs_to_config.
@@ -41,7 +41,7 @@ class ArtifactPicker(Container):
     .wbctx CollapsibleTitle { padding: 0 1; }
     .wbctx Contents { padding: 0 1; }
     .wbctx.-collapsed { padding-bottom: 0; padding-left: 0; }
-    .slot { border: round #76b900; padding: 1; margin-bottom: 1; }
+    .slot { border: round #76b900; padding: 1; margin-bottom: 1; height: 1fr; }
     .slot-title { color: $text; text-style: bold; }
     .slot-help { color: $text-muted; }
     .slot-status { color: $text-muted; }
@@ -75,65 +75,64 @@ class ArtifactPicker(Container):
             yield Static("No artifact inputs for this stage.", classes="placeholder")
             return
 
-        with Vertical():
-            with Collapsible(
-                title=self._wbctx_title(),
-                collapsed=True,
-                classes="wbctx",
-                id="wbctx",
-            ):
-                with Horizontal():
-                    yield Input(
-                        value=self._wb_entity or "",
-                        placeholder="entity",
-                        id="wb-entity",
-                        classes="wbctx-entity",
-                    )
-                    yield Input(
-                        value=self._wb_project or "",
-                        placeholder="project",
-                        id="wb-project",
-                        classes="wbctx-project",
-                    )
-                    yield Button("Refresh", id="wbrefresh-all", classes="refresh-btn")
+        with Collapsible(
+            title=self._wbctx_title(),
+            collapsed=True,
+            classes="wbctx",
+            id="wbctx",
+        ):
+            with Horizontal():
+                yield Input(
+                    value=self._wb_entity or "",
+                    placeholder="entity",
+                    id="wb-entity",
+                    classes="wbctx-entity",
+                )
+                yield Input(
+                    value=self._wb_project or "",
+                    placeholder="project",
+                    id="wb-project",
+                    classes="wbctx-project",
+                )
+                yield Button("Refresh", id="wbrefresh-all", classes="refresh-btn")
 
-            for slot, artifact in self._artifacts.items():
-                with Container(classes="slot", id=f"slot-{slot}"):
-                    yield Static(f"{slot}", classes="slot-title")
-                    yield Static(
-                        (
-                            f"Default: {artifact.default_name} · "
-                            "Provide version (v10/latest) or full ref."
-                        ),
-                        classes="slot-help",
+        for slot, artifact in self._artifacts.items():
+            with VerticalScroll(classes="slot", id=f"slot-{slot}"):
+                yield Static(f"{slot}", classes="slot-title")
+                yield Static(
+                    (
+                        f"Default: {artifact.default_name} · "
+                        "Provide version (v10/latest) or full ref."
+                    ),
+                    classes="slot-help",
+                )
+                with Horizontal():
+                    yield Select(
+                        options=[("W&B", "wandb"), ("HF Hub", "hf"), ("Manual", "manual")],
+                        value="wandb",
+                        id=f"src-{slot}",
+                        allow_blank=False,
+                        classes="src-select",
                     )
-                    with Horizontal():
-                        yield Select(
-                            options=[("W&B", "wandb"), ("HF Hub", "hf"), ("Manual", "manual")],
-                            value="wandb",
-                            id=f"src-{slot}",
-                            allow_blank=False,
-                            classes="src-select",
-                        )
-                        yield Select(
-                            options=[("latest", "latest")],
-                            value="latest",
-                            id=f"wbver-{slot}",
-                            allow_blank=False,
-                            prompt="Version",
-                            classes="wbver-select",
-                        )
-                        yield Button(
-                            "Refresh",
-                            id=f"wbrefresh-{slot}",
-                            classes="refresh-btn",
-                        )
-                        yield Input(
-                            placeholder="v10 | latest | entity/project/name:v10 | art://...",
-                            id=f"val-{slot}",
-                            classes="ref-input",
-                        )
-                    yield Static("", id=f"wbstatus-{slot}", classes="slot-status")
+                    yield Select(
+                        options=[("latest", "latest")],
+                        value="latest",
+                        id=f"wbver-{slot}",
+                        allow_blank=False,
+                        prompt="Version",
+                        classes="wbver-select",
+                    )
+                    yield Button(
+                        "Refresh",
+                        id=f"wbrefresh-{slot}",
+                        classes="refresh-btn",
+                    )
+                    yield Input(
+                        placeholder="v10 | latest | entity/project/name:v10 | art://...",
+                        id=f"val-{slot}",
+                        classes="ref-input",
+                    )
+                yield Static("", id=f"wbstatus-{slot}", classes="slot-status")
 
     def on_mount(self) -> None:
         self._update_wbctx_title()

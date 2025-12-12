@@ -60,7 +60,7 @@ class RunConfig:
         account: Slurm account name
         partition: Slurm partition name
         run_partition: Partition to use for attached execution (--run), overrides partition
-        launch_partition: Partition to use for detached execution (--launch), overrides partition
+        batch_partition: Partition to use for detached execution (--batch), overrides partition
         time: Slurm job time limit (HH:MM:SS)
         job_name: Slurm job name
         ntasks_per_node: Slurm tasks per node
@@ -117,7 +117,7 @@ class RunConfig:
     account: str | None = None
     partition: str | None = None
     run_partition: str | None = None
-    launch_partition: str | None = None
+    batch_partition: str | None = None
     time: str = "04:00:00"
     job_name: str = "nemo-run"
     ntasks_per_node: int | None = None
@@ -171,26 +171,26 @@ def resolve_partition(config: RunConfig, is_launch: bool) -> str | None:
     """Resolve the effective partition based on execution mode.
 
     Selects the appropriate partition based on whether the job is being
-    launched (detached) or run (attached):
-    - For --launch (detached): use launch_partition if defined, else partition
+    batched (detached) or run (attached):
+    - For --batch (detached): use batch_partition if defined, else partition
     - For --run (attached): use run_partition if defined, else partition
 
     Args:
         config: RunConfig with partition settings.
-        is_launch: True for detached execution (--launch), False for attached (--run).
+        is_launch: True for detached execution (--batch), False for attached (--run).
 
     Returns:
         The effective partition name, or None if no partition is configured.
 
     Example:
-        >>> config = RunConfig(partition="batch", launch_partition="interactive")
+        >>> config = RunConfig(partition="batch", batch_partition="interactive")
         >>> resolve_partition(config, is_launch=False)
         'batch'
         >>> resolve_partition(config, is_launch=True)
         'interactive'
     """
-    if is_launch and config.launch_partition is not None:
-        return config.launch_partition
+    if is_launch and config.batch_partition is not None:
+        return config.batch_partition
     if not is_launch and config.run_partition is not None:
         return config.run_partition
     return config.partition
@@ -235,7 +235,9 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
             token = HfFolder.get_token()
             if token:
                 merged_env["HF_TOKEN"] = token
-                sys.stderr.write("[info] Detected HuggingFace login, adding HF_TOKEN to environment\n")
+                sys.stderr.write(
+                    "[info] Detected HuggingFace login, adding HF_TOKEN to environment\n"
+                )
         except Exception:
             pass  # huggingface_hub not installed or no token
 
@@ -430,12 +432,12 @@ def _build_packager() -> Any:
 def _find_run_config() -> Path | None:
     """Find run config file in cwd or walking up to project root.
 
-    Searches for: run.toml, run.yaml, run.yml, run.json
+    Searches for: env.toml, run.toml, run.yaml, run.yml, run.json
 
     Returns:
         Path to run config file, or None if not found.
     """
-    filenames = ["run.toml", "run.yaml", "run.yml", "run.json"]
+    filenames = ["env.toml", "run.toml", "run.yaml", "run.yml", "run.json"]
     for path in [Path.cwd(), *Path.cwd().parents]:
         for filename in filenames:
             run_file = path / filename
@@ -562,7 +564,7 @@ def list_run_profiles(config_path: Path | None = None) -> list[str]:
     return sorted(profiles)
 
 
-def load_wandb_config(config_path: Path | None = None) -> "WandbConfig | None":
+def load_wandb_config(config_path: Path | None = None) -> WandbConfig | None:
     """Load wandb configuration from run.toml [wandb] section.
 
     The [wandb] section is a top-level section in run.toml that configures
@@ -633,7 +635,6 @@ def run_with_nemo_run(
     """
     try:
         import nemo_run as run
-        from nemo_run.run.ray.cluster import RayCluster
         from nemo_run.run.ray.job import RayJob
     except ImportError:
         sys.stderr.write(

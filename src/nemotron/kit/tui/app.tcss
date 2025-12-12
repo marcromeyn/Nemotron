@@ -69,3 +69,7 @@ ArtifactPicker {
 ConfigForm {
     height: 1fr;
 }
+
+ConfigEditor {
+    height: 1fr;
+}

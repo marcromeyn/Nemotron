@@ -5,7 +5,7 @@ import tempfile
 from dataclasses import is_dataclass
 
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
 from textual.widgets import Static, TabbedContent
 
 from nemotron.kit.app import _apply_artifact_refs_to_config
@@ -13,8 +13,9 @@ from nemotron.kit.run import load_run_profile, resolve_partition, run_with_nemo_
 from nemotron.kit.tui import StageCommandMeta
 from nemotron.kit.tui.form_utils import dataclass_to_primitive_dict
 from nemotron.kit.tui.widgets.artifact_picker import ArtifactPicker
-from nemotron.kit.tui.widgets.config_form import ConfigForm
+from nemotron.kit.tui.widgets.config_editor import ConfigEditor
 from nemotron.kit.tui.widgets.run_controls import RunControls
+from nemotron.kit.tui.widgets.yaml_editor import YamlEditor
 
 
 class StageConfigScreen(Vertical):
@@ -22,22 +23,32 @@ class StageConfigScreen(Vertical):
         super().__init__()
         self.stage = stage
         self._artifact_picker: ArtifactPicker | None = None
-        self._config_form: ConfigForm | None = None
+        self._config_editor: ConfigEditor | None = None
+        self._yaml_editor: YamlEditor | None = None
         self._run_controls: RunControls | None = None
         self._tabs: TabbedContent | None = None
 
     def compose(self) -> ComposeResult:
         # NOTE: Textual doesn't always auto-select the first tab when `initial` is empty
         # (varies by version / internal state). Force the initial pane.
-        with TabbedContent("Input Artifact", "Job Config", "Eval", initial="tab-1") as tabs:
+        with TabbedContent(
+            "Input Artifact",
+            "Job Config",
+            "YAML",
+            "Eval",
+            initial="tab-1",
+        ) as tabs:
             self._tabs = tabs
             self._artifact_picker = ArtifactPicker(self.stage.artifacts)
-            yield VerticalScroll(self._artifact_picker)
+            yield self._artifact_picker
 
-            self._config_form = ConfigForm(self.stage.config_type)
-            yield VerticalScroll(self._config_form)
+            self._config_editor = ConfigEditor.from_dataclass(self.stage.config_type)
+            yield self._config_editor
 
-            yield VerticalScroll(Static("Eval configuration coming soon.", classes="placeholder"))
+            self._yaml_editor = YamlEditor(self._config_editor.model, show_line_numbers=True)
+            yield self._yaml_editor
+
+            yield Static("Eval configuration coming soon.", classes="placeholder")
 
         self._run_controls = RunControls(stage_name=self.stage.name)
         yield self._run_controls
@@ -51,16 +62,16 @@ class StageConfigScreen(Vertical):
             # Ensure the first pane is active and disable the placeholder Eval tab.
             if not self._tabs.active:
                 self._tabs.active = "tab-1"
-            self._tabs.disable_tab("tab-3")
+            self._tabs.disable_tab("tab-4")
 
         self.call_after_refresh(_post_mount)
 
     async def run_stage(self, detached: bool) -> None:
-        if self._config_form is None or self._run_controls is None:
+        if self._config_editor is None or self._run_controls is None:
             return
 
         try:
-            cfg = self._config_form.build_config_instance()
+            cfg = self._config_editor.build_config_instance()
         except Exception as e:
             self._run_controls.set_status(str(e))
             return
@@ -133,3 +144,11 @@ class StageConfigScreen(Vertical):
 
     async def on_run_controls_run_requested(self, message: RunControls.RunRequested) -> None:
         await self.run_stage(detached=message.detached)
+
+    def on_config_editor_changed(self, _message: ConfigEditor.Changed) -> None:
+        if self._yaml_editor is not None:
+            self._yaml_editor.sync_from_model()
+
+    def on_yaml_editor_changed(self, _message: YamlEditor.Changed) -> None:
+        if self._config_editor is not None:
+            self._config_editor.refresh_from_model()

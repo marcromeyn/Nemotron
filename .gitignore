@@ -68,6 +68,7 @@ checkpoints/
 data/
 workspace/
 wandb/
+.nemotron/
 
 # Claude Code
 CLAUDE.md

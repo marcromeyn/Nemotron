@@ -23,7 +23,9 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.0.0",
+    "typer>=0.12.0",
     "tyro>=0.8.0",
+    "omegaconf>=2.3.0",
     "rich>=13.0.0",
     "textual>=0.70.0",
     "ray==2.50.0",
@@ -69,6 +71,7 @@ Repository = "https://github.com/nemotron/nemotron"
 
 [project.scripts]
 nemotron = "nemotron.__main__:main"
+nemotron-legacy = "nemotron.__main__:main_legacy"
 
 [project.entry-points."fsspec.specs"]
 art = "nemotron.art.filesystem:ArtifactFileSystem"

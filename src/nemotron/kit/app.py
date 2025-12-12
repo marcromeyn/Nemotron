@@ -480,7 +480,7 @@ class App:
 
         args = sys.argv[1:]
 
-        # Check for --run/--launch and execute via nemo-run if specified
+        # Check for --run/--batch and execute via nemo-run if specified
         run_name, run_overrides, remaining_args, is_launch = _extract_run_args(args)
         if run_name is not None:
             _execute_with_nemo_run(run_name, run_overrides, remaining_args, is_launch, self)
@@ -641,17 +641,17 @@ def _extract_fn_kwargs_from_artifacts(
 
 
 def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list[str], bool]:
-    """Extract --run/--launch and --run.<key>/--launch.<key> arguments.
+    """Extract --run/--batch and --run.<key>/--batch.<key> arguments.
 
     Args:
         args: Command line arguments
 
     Returns:
         Tuple of (run_name, run_overrides, remaining_args, is_launch).
-        is_launch is True when --launch was used (implies detach=True).
+        is_launch is True when --batch was used (implies detach=True).
 
     Raises:
-        ValueError: If both --run and --launch are specified.
+        ValueError: If both --run and --batch are specified.
     """
     run_name: str | None = None
     launch_name: str | None = None
@@ -684,26 +684,26 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
         elif arg.startswith("-r="):
             run_name = arg[3:]
             i += 1
-        # Handle --launch / -l
-        elif arg == "--launch" or arg == "-l":
+        # Handle --batch / -b
+        elif arg == "--batch" or arg == "-b":
             if i + 1 < len(args):
                 launch_name = args[i + 1]
                 i += 2
             else:
                 remaining.append(arg)
                 i += 1
-        elif arg.startswith("--launch."):
-            key = arg[9:]  # Remove "--launch."
+        elif arg.startswith("--batch."):
+            key = arg[8:]  # Remove "--batch."
             if i + 1 < len(args):
                 run_overrides[key] = args[i + 1]
                 i += 2
             else:
                 remaining.append(arg)
                 i += 1
-        elif arg.startswith("--launch="):
-            launch_name = arg[9:]
+        elif arg.startswith("--batch="):
+            launch_name = arg[8:]
             i += 1
-        elif arg.startswith("-l="):
+        elif arg.startswith("-b="):
             launch_name = arg[3:]
             i += 1
         else:
@@ -712,7 +712,7 @@ def _extract_run_args(args: list[str]) -> tuple[str | None, dict[str, str], list
 
     # Validate mutual exclusivity
     if run_name is not None and launch_name is not None:
-        raise ValueError("--run and --launch are mutually exclusive. Use --run for attached execution or --launch for detached execution.")
+        raise ValueError("--run and --batch are mutually exclusive. Use --run for attached execution or --batch for detached execution.")
 
     # Determine final name and whether launch mode is active
     is_launch = launch_name is not None
@@ -996,7 +996,7 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
     # Load profile from run.toml
     profile = load_run_profile(run_name)
 
-    # Force detach=True and ray_mode="job" when using --launch
+    # Force detach=True and ray_mode="job" when using --batch
     # ray_mode="job" ensures the cluster terminates after the job completes
     if is_launch:
         profile.detach = True

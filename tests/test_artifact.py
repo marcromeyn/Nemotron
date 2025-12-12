@@ -614,38 +614,38 @@ def test_resolve_partition_run_override():
 
     # --run should use run_partition
     assert resolve_partition(config, is_launch=False) == "interactive"
-    # --launch should still use base partition
+    # --batch should still use base partition
     assert resolve_partition(config, is_launch=True) == "batch"
 
 
-def test_resolve_partition_launch_override():
-    """Test resolve_partition uses launch_partition for detached execution."""
+def test_resolve_partition_batch_override():
+    """Test resolve_partition uses batch_partition for detached execution."""
     from nemotron.kit.run import RunConfig, resolve_partition
 
     config = RunConfig(
         partition="batch",
-        launch_partition="backfill",
+        batch_partition="backfill",
     )
 
     # --run should use base partition
     assert resolve_partition(config, is_launch=False) == "batch"
-    # --launch should use launch_partition
+    # --batch should use batch_partition
     assert resolve_partition(config, is_launch=True) == "backfill"
 
 
 def test_resolve_partition_both_overrides():
-    """Test resolve_partition with both run_partition and launch_partition."""
+    """Test resolve_partition with both run_partition and batch_partition."""
     from nemotron.kit.run import RunConfig, resolve_partition
 
     config = RunConfig(
         partition="batch",
         run_partition="interactive",
-        launch_partition="backfill",
+        batch_partition="backfill",
     )
 
     # --run uses run_partition
     assert resolve_partition(config, is_launch=False) == "interactive"
-    # --launch uses launch_partition
+    # --batch uses batch_partition
     assert resolve_partition(config, is_launch=True) == "backfill"
 
 
@@ -655,7 +655,7 @@ def test_resolve_partition_no_base():
 
     config = RunConfig(
         run_partition="interactive",
-        launch_partition="backfill",
+        batch_partition="backfill",
     )
 
     # Uses specific partitions when available
@@ -674,7 +674,7 @@ def test_resolve_partition_none():
 
 
 def test_load_run_profile_with_partition_overrides():
-    """Test loading run profile with run_partition and launch_partition fields."""
+    """Test loading run profile with run_partition and batch_partition fields."""
     from nemotron.kit.run import load_run_profile, resolve_partition
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -685,13 +685,13 @@ executor = "slurm"
 account = "my-account"
 partition = "batch"
 run_partition = "interactive"
-launch_partition = "backfill"
+batch_partition = "backfill"
 """)
         profile = load_run_profile("slurm", config_path=run_toml)
 
         assert profile.partition == "batch"
         assert profile.run_partition == "interactive"
-        assert profile.launch_partition == "backfill"
+        assert profile.batch_partition == "backfill"
 
         # Verify resolution
         assert resolve_partition(profile, is_launch=False) == "interactive"
@@ -713,15 +713,15 @@ run_partition = "interactive"
 
 [child]
 extends = "base"
-launch_partition = "backfill"
+batch_partition = "backfill"
 """)
         profile = load_run_profile("child", config_path=run_toml)
 
         # partition and run_partition inherited from base
         assert profile.partition == "batch"
         assert profile.run_partition == "interactive"
-        # launch_partition defined in child
-        assert profile.launch_partition == "backfill"
+        # batch_partition defined in child
+        assert profile.batch_partition == "backfill"
 
         # Verify resolution
         assert resolve_partition(profile, is_launch=False) == "interactive"

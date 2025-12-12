@@ -1,1 +1,1 @@
-__all__ = ["stage_config"]
+__all__ = ["recipe_config", "stage_config"]
