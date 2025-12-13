@@ -413,7 +413,7 @@ def _distribute_shards_to_splits(
     all_shards: list[tuple[str, str]] = []
     for weight, prefix in pairs:
         for shard_idx in range(num_shards):
-            all_shards.append((weight, f"{prefix}_{shard_idx:04d}"))
+            all_shards.append((weight, f"{prefix}_{shard_idx:06d}"))
 
     # Use seeded RNG for reproducibility
     rng = random.Random(seed)

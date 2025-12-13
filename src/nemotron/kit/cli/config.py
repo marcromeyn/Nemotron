@@ -14,7 +14,7 @@ from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
 
-from nemotron.kit.cli.env import load_env_profile
+from nemotron.kit.cli.env import get_wandb_config, load_env_profile
 from nemotron.kit.cli.globals import GlobalContext
 
 
@@ -135,6 +135,11 @@ def build_job_config(
     elif existing_env:
         # No profile, but config has run.env - preserve it
         run_updates["env"] = existing_env
+
+    # Add wandb config from env.toml (if present)
+    wandb_config = get_wandb_config()
+    if wandb_config:
+        run_updates["wandb"] = OmegaConf.to_container(wandb_config, resolve=True)
 
     # Merge run updates into existing run section (or create it)
     if "run" in job_config:

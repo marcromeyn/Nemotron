@@ -124,18 +124,21 @@ prep.command(
     PreTrainDataPrepConfig,
     pretrain_data_main,
     description="Tokenize data for pretraining (bin/idx format)",
+    script_path="src/nemotron/recipes/nano3/stage0_pretrain/data_prep.py",
 )
 prep.command(
     "sft",
     SFTDataPrepConfig,
     sft_data_main,
     description="Prepare data for SFT (JSONL format)",
+    script_path="src/nemotron/recipes/nano3/stage1_sft/data_prep.py",
 )
 prep.command(
     "rl",
     RLDataPrepConfig,
     rl_data_main,
     description="Prepare data for RL (JSONL chat format)",
+    script_path="src/nemotron/recipes/nano3/stage2_rl/data_prep.py",
 )
 
 data.command(

@@ -144,3 +144,20 @@ def get_wandb_config(config_path: Optional[Path] = None) -> Optional[DictConfig]
         return OmegaConf.create(all_profiles["wandb"])
 
     return None
+
+
+def get_cli_config(config_path: Optional[Path] = None) -> Optional[DictConfig]:
+    """Get CLI display configuration from env.toml if present.
+
+    Args:
+        config_path: Optional path to env.toml
+
+    Returns:
+        CLI config as DictConfig, or None if not present
+    """
+    all_profiles = load_env_file(config_path)
+
+    if "cli" in all_profiles:
+        return OmegaConf.create(all_profiles["cli"])
+
+    return None

@@ -196,6 +196,90 @@ def resolve_partition(config: RunConfig, is_launch: bool) -> str | None:
     return config.partition
 
 
+def patch_nemo_run_rsync_accept_new_host_keys() -> None:
+    """Patch nemo-run rsync to avoid hanging on first-time host key prompts.
+
+    nemo-run's SSH tunnel uses Paramiko for its control connection, but the
+    rsync step shells out to the system `ssh`, which can block waiting for an
+    interactive StrictHostKeyChecking prompt.
+
+    We set `StrictHostKeyChecking=accept-new` unless the caller already
+    provided a StrictHostKeyChecking option.
+    """
+
+    try:
+        import nemo_run.core.tunnel.rsync as rsync_mod
+    except Exception:
+        return
+
+    if getattr(rsync_mod.rsync, "_nemotron_patched", False):
+        return
+
+    orig = rsync_mod.rsync
+
+    def patched(*args, **kwargs):
+        ssh_opts = kwargs.get("ssh_opts", "") or ""
+        if "StrictHostKeyChecking" not in ssh_opts:
+            ssh_opts = (ssh_opts + " " if ssh_opts else "") + "-o StrictHostKeyChecking=accept-new"
+        if "BatchMode" not in ssh_opts:
+            ssh_opts = (ssh_opts + " " if ssh_opts else "") + "-o BatchMode=yes"
+        if "PreferredAuthentications" not in ssh_opts:
+            ssh_opts = (ssh_opts + " " if ssh_opts else "") + (
+                "-o PreferredAuthentications=publickey"
+            )
+        if "ConnectTimeout" not in ssh_opts:
+            ssh_opts = (ssh_opts + " " if ssh_opts else "") + "-o ConnectTimeout=30"
+        kwargs["ssh_opts"] = ssh_opts
+
+        rsync_opts = kwargs.get("rsync_opts", "") or ""
+        if "--info=progress2" not in rsync_opts:
+            rsync_opts = (rsync_opts + " " if rsync_opts else "") + "--info=progress2"
+        if "--timeout" not in rsync_opts:
+            rsync_opts = (rsync_opts + " " if rsync_opts else "") + "--timeout=60"
+        kwargs["rsync_opts"] = rsync_opts
+
+        # Default exclusions for our repo (avoid syncing large non-runtime dirs).
+        # Users can override by passing `exclude=...` explicitly.
+        kwargs.setdefault(
+            "exclude",
+            (
+                ".git",
+                ".venv",
+                "__pycache__",
+                ".ruff_cache",
+                ".pytest_cache",
+                "output",
+                "artifacts",
+                "wandb",
+                "usage-cookbook",
+                "use-case-examples",
+            ),
+        )
+
+        # Show progress/errors instead of looking hung.
+        kwargs.setdefault("hide_output", False)
+
+        return orig(*args, **kwargs)
+
+    patched._nemotron_patched = True  # type: ignore[attr-defined]
+    rsync_mod.rsync = patched  # type: ignore[assignment]
+
+    # Patch already-imported call sites that `from ... import rsync`.
+    try:
+        import nemo_run.run.experiment as exp
+
+        exp.rsync = patched  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    try:
+        import nemo_run.run.ray.slurm as slurm
+
+        slurm.rsync = patched  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
 def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) -> Any:
     """Build nemo-run executor from RunConfig.
 
@@ -217,6 +301,8 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
             "nemo-run not installed. Install with: pip install nemo-run\n"
             "Or use direct execution without --run"
         ) from e
+
+    patch_nemo_run_rsync_accept_new_host_keys()
 
     # Parse and merge environment variables
     merged_env = {}
@@ -375,13 +461,13 @@ def _build_packager() -> Any:
     """Build a HybridPackager for selective file syncing.
 
     Packages only the necessary files for remote cluster sync:
-    - src/ directory: only .py, .json, .jinja, .typed files (excludes __pycache__)
-    - tests/ directory: only .py files
-    - Top-level files: pyproject.toml, run.toml, README.md
+    - src/ directory: only .py, .json, .jinja, .yaml, .typed files (excludes __pycache__)
+    - Top-level files: pyproject.toml, env.toml
 
     This avoids packaging:
     - __pycache__/ directories with stale .pyc bytecode
-    - Large unnecessary directories like usage-cookbook/
+    - Large unnecessary directories like usage-cookbook/, use-case-examples/
+    - tests/ directory (not needed for execution)
 
     Returns:
         A HybridPackager instance configured for selective syncing.
@@ -404,25 +490,20 @@ def _build_packager() -> Any:
                 include_pattern='src -name "*.jinja"',
                 relative_path=".",
             ),
-            "src_typed": PatternPackager(
-                include_pattern='src -name "py.typed"',
+            "src_yaml": PatternPackager(
+                include_pattern='src -name "*.yaml"',
                 relative_path=".",
             ),
-            # Package tests/ with only .py files
-            "tests": PatternPackager(
-                include_pattern='tests -name "*.py"',
+            "src_typed": PatternPackager(
+                include_pattern='src -name "py.typed"',
                 relative_path=".",
             ),
             "pyproject": PatternPackager(
                 include_pattern="pyproject.toml",
                 relative_path=".",
             ),
-            "run_toml": PatternPackager(
-                include_pattern="run.toml",
-                relative_path=".",
-            ),
-            "readme": PatternPackager(
-                include_pattern="README.md",
+            "env_toml": PatternPackager(
+                include_pattern="env.toml",
                 relative_path=".",
             ),
         },
@@ -758,9 +839,15 @@ def run_with_nemo_run(
                 yaml.dump(runtime_env, f)
                 runtime_env_yaml = f.name
 
+        ray_workdir = run_config.ray_working_dir
+        if not ray_workdir:
+            # For Ray jobs, prefer nemo-run's native workdir rsync (respects .gitignore)
+            # instead of the packager->tar->extract->rsync path.
+            ray_workdir = "."
+
         ray_job.start(
             command=cmd,
-            workdir=run_config.ray_working_dir,
+            workdir=ray_workdir,
             pre_ray_start_commands=pre_ray_start_commands,
             runtime_env_yaml=runtime_env_yaml,
         )

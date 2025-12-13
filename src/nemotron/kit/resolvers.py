@@ -31,17 +31,42 @@ Usage in training script:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from omegaconf import OmegaConf
 
-
-# Global artifact registry for the resolver
+# Global artifact registry for the resolver.
+# Keys are user-facing (e.g. "data") and values are resolved artifact info.
 _ARTIFACT_REGISTRY: dict[str, dict[str, Any]] = {}
 
+# Internal cache for de-duplicating resolution work.
+_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
 
-def _resolve_artifact(name: str, version: str | None = None) -> dict[str, Any]:
+ResolverMode = Literal["active_run", "pre_init"]
+
+
+def _parse_artifact_ref(artifact_ref: str) -> tuple[str, str | None]:
+    if ":" in artifact_ref:
+        name, version = artifact_ref.rsplit(":", 1)
+        return name, version
+    return artifact_ref, None
+
+
+def _normalize_version(version: str | None) -> str:
+    if version is None:
+        return "latest"
+    if version == "latest":
+        return "latest"
+    if version.startswith("v"):
+        return version
+    if version.isdigit():
+        return f"v{version}"
+    return version
+
+
+def _resolve_artifact_active_run(name: str, version: str | None = None) -> dict[str, Any]:
     """Resolve an artifact and cache the result.
 
     Args:
@@ -52,22 +77,14 @@ def _resolve_artifact(name: str, version: str | None = None) -> dict[str, Any]:
         Dict with artifact info: {"path": str, "version": int, "name": str}
     """
     # Build cache key
-    cache_key = f"{name}:{version}" if version else f"{name}:latest"
+    cache_key = f"active:{name}:{_normalize_version(version)}"
 
-    if cache_key in _ARTIFACT_REGISTRY:
-        return _ARTIFACT_REGISTRY[cache_key]
+    if cache_key in _ARTIFACT_CACHE:
+        return _ARTIFACT_CACHE[cache_key]
 
     import wandb
 
-    # Build artifact reference
-    if version is not None:
-        # Normalize version format
-        if version.startswith("v"):
-            artifact_ref = f"{name}:{version}"
-        else:
-            artifact_ref = f"{name}:v{version}"
-    else:
-        artifact_ref = f"{name}:latest"
+    artifact_ref = f"{name}:{_normalize_version(version)}"
 
     # Use artifact - this registers lineage in W&B
     artifact = wandb.use_artifact(artifact_ref)
@@ -80,11 +97,72 @@ def _resolve_artifact(name: str, version: str | None = None) -> dict[str, Any]:
         "version": artifact.version,
         "name": artifact.name,
         "type": artifact.type,
+        "qualified_name": getattr(artifact, "qualified_name", None),
     }
 
-    # Cache for future lookups
-    _ARTIFACT_REGISTRY[cache_key] = result
+    _ARTIFACT_CACHE[cache_key] = result
 
+    return result
+
+
+def resolve_artifact_pre_init(
+    artifact_ref: str,
+    *,
+    entity: str | None = None,
+    project: str | None = None,
+    patch_http_digest: bool = False,
+) -> dict[str, Any]:
+    """Resolve a W&B artifact via `wandb.Api()` without requiring an active run.
+
+    This is used in training scripts where `wandb.init()` is handled elsewhere
+    (e.g. Megatron-Bridge). It returns `qualified_name` so lineage can be
+    registered once a run becomes active.
+    """
+    name, version = _parse_artifact_ref(artifact_ref)
+    version_str = _normalize_version(version)
+    cache_key = (
+        f"pre_init:{name}:{version_str}:"
+        f"{entity or ''}:{project or ''}:{int(patch_http_digest)}"
+    )
+
+    if cache_key in _ARTIFACT_CACHE:
+        return _ARTIFACT_CACHE[cache_key]
+
+    import wandb
+
+    if patch_http_digest:
+        try:
+            from nemotron.kit.wandb import patch_wandb_http_handler_skip_digest_verification
+
+            patch_wandb_http_handler_skip_digest_verification()
+        except Exception:
+            # Best-effort: do not fail artifact resolution because patching failed.
+            pass
+
+    api = wandb.Api()
+
+    resolved_entity = entity or os.environ.get("WANDB_ENTITY")
+    resolved_project = project or os.environ.get("WANDB_PROJECT") or "nemotron"
+
+    # Fully-qualified path is typically entity/project/name:version.
+    # Keep compatibility with earlier behavior that allowed omitting entity.
+    if resolved_entity:
+        full_ref = f"{resolved_entity}/{resolved_project}/{name}:{version_str}"
+    else:
+        full_ref = f"{resolved_project}/{name}:{version_str}"
+
+    artifact = api.artifact(full_ref)
+    local_path = artifact.download(skip_cache=True)
+
+    result = {
+        "path": local_path,
+        "version": getattr(artifact, "version", None),
+        "name": getattr(artifact, "name", name),
+        "type": getattr(artifact, "type", None),
+        "qualified_name": getattr(artifact, "qualified_name", None),
+    }
+
+    _ARTIFACT_CACHE[cache_key] = result
     return result
 
 
@@ -120,7 +198,9 @@ def register_resolvers(
     artifacts: dict[str, str] | None = None,
     *,
     replace: bool = True,
-) -> None:
+    mode: ResolverMode = "active_run",
+    pre_init_patch_http_digest: bool = False,
+) -> list[str]:
     """Register OmegaConf resolvers for artifact resolution.
 
     This should be called early in the training script, before loading
@@ -141,20 +221,27 @@ def register_resolvers(
         >>> config = OmegaConf.load("train.yaml")
         >>> # ${art.data.path} now resolves to the downloaded artifact path
     """
-    # Pre-resolve all artifacts to register W&B lineage
+    qualified_names: list[str] = []
+
+    # Pre-resolve all artifacts
     if artifacts:
         for key, artifact_ref in artifacts.items():
-            # Parse name and version from reference
-            if ":" in artifact_ref:
-                name, version = artifact_ref.rsplit(":", 1)
+            if mode == "active_run":
+                name, version = _parse_artifact_ref(artifact_ref)
+                result = _resolve_artifact_active_run(name, version)
+            elif mode == "pre_init":
+                result = resolve_artifact_pre_init(
+                    artifact_ref,
+                    patch_http_digest=pre_init_patch_http_digest,
+                )
             else:
-                name, version = artifact_ref, None
+                raise ValueError(f"Unknown resolver mode: {mode}")
 
-            # Resolve and cache
-            result = _resolve_artifact(name, version)
-
-            # Store under the user's key (e.g., "data", "model")
             _ARTIFACT_REGISTRY[key] = result
+
+            qname = result.get("qualified_name")
+            if qname:
+                qualified_names.append(str(qname))
 
     # Register the resolver
     # ${art.data.path} -> _art_resolver("data", "path")
@@ -165,13 +252,17 @@ def register_resolvers(
         replace=replace,
     )
 
+    return qualified_names
+
 
 def register_resolvers_from_config(
     config: Any,
     artifacts_key: str = "run",
     *,
     replace: bool = True,
-) -> None:
+    mode: ResolverMode = "active_run",
+    pre_init_patch_http_digest: bool = False,
+) -> list[str]:
     """Register artifact resolvers from a config's run section.
 
     This function extracts artifact references from the config's run section.
@@ -218,10 +309,16 @@ def register_resolvers_from_config(
                     artifacts[key] = value
 
     if artifacts:
-        register_resolvers(artifacts, replace=replace)
+        return register_resolvers(
+            artifacts,
+            replace=replace,
+            mode=mode,
+            pre_init_patch_http_digest=pre_init_patch_http_digest,
+        )
     else:
         # Still register the resolver, just without pre-resolved artifacts
         register_resolvers(replace=replace)
+        return []
 
 
 def _is_artifact_reference(value: Any) -> bool:
@@ -273,3 +370,4 @@ def clear_artifact_cache() -> None:
     Useful for testing or when you want to re-resolve artifacts.
     """
     _ARTIFACT_REGISTRY.clear()
+    _ARTIFACT_CACHE.clear()

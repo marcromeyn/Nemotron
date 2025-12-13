@@ -1,0 +1,287 @@
+# Copyright (c) Nemotron Contributors
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+import ast
+import tokenize
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _read_text(path: Path) -> str:
+    with tokenize.open(path) as f:
+        return f.read()
+
+
+def _node_source(lines: list[str], node: ast.AST) -> str:
+    if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
+        return ""
+    start = int(getattr(node, "lineno")) - 1
+    end = int(getattr(node, "end_lineno"))
+    return "".join(lines[start:end])
+
+
+def _is_nemotron_import(node: ast.AST, *, package_prefix: str) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        if node.module is None:
+            return False
+        return node.module == package_prefix or node.module.startswith(package_prefix + ".")
+    if isinstance(node, ast.Import):
+        return any(
+            a.name == package_prefix or a.name.startswith(package_prefix + ".") for a in node.names
+        )
+    return False
+
+
+def _resolve_module_path(repo_root: Path, module: str) -> Path:
+    base = repo_root / "src" / Path(*module.split("."))
+    py = base.with_suffix(".py")
+    if py.exists():
+        return py
+    init = base / "__init__.py"
+    if init.exists():
+        return init
+    raise FileNotFoundError(f"Could not resolve module '{module}' under {repo_root / 'src'}")
+
+
+@dataclass
+class _ModuleInline:
+    module: str
+    external_imports: list[str]
+    prelude_assignments: list[str]
+    body: str
+    exports: set[str]
+
+
+def _module_exports(mod_ast: ast.Module) -> set[str]:
+    exports: set[str] = set()
+    for node in mod_ast.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            exports.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            else:
+                targets = [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    exports.add(t.id)
+    return {n for n in exports if n and not (n.startswith("__") and n.endswith("__"))}
+
+
+def _parse_module_for_inlining(
+    module: str,
+    *,
+    repo_root: Path,
+    package_prefix: str,
+) -> tuple[_ModuleInline, list[str]]:
+    path = _resolve_module_path(repo_root, module)
+    text = _read_text(path)
+    lines = text.splitlines(keepends=True)
+    mod_ast = ast.parse(text, filename=str(path))
+
+    external_imports: list[str] = []
+    body_parts: list[str] = []
+    prelude_assignments: list[str] = []
+    dependencies: list[str] = []
+
+    for node in mod_ast.body:
+        # Never inline/emit __future__ imports from library modules.
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            continue
+
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if _is_nemotron_import(node, package_prefix=package_prefix):
+                # Track dependency modules and synthesize alias assignments where needed.
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    dependencies.append(node.module)
+                    for alias in node.names:
+                        if alias.name == "*":
+                            raise ValueError(
+                                f"Star import not supported in SelfContainedPackager: {module}"
+                            )
+                        if alias.asname and alias.asname != alias.name:
+                            prelude_assignments.append(f"{alias.asname} = {alias.name}\n")
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        dependencies.append(alias.name)
+                        asname = alias.asname
+                        if asname:
+                            prelude_assignments.append(
+                                f"{asname} = __nemotron_namespaces['{alias.name}']\n"
+                            )
+                continue
+
+            external_imports.append(_node_source(lines, node))
+            continue
+
+        body_parts.append(_node_source(lines, node))
+
+    exports = _module_exports(mod_ast)
+    return (
+        _ModuleInline(
+            module=module,
+            external_imports=external_imports,
+            prelude_assignments=prelude_assignments,
+            body="".join(body_parts),
+            exports=exports,
+        ),
+        dependencies,
+    )
+
+
+def inline_imports(
+    entry_path: Path,
+    *,
+    repo_root: Path,
+    package_prefix: str = "nemotron",
+) -> str:
+    """Inline imports from `package_prefix` into a single self-contained script."""
+    entry_text = _read_text(entry_path)
+    entry_lines = entry_text.splitlines(keepends=True)
+    entry_ast = ast.parse(entry_text, filename=str(entry_path))
+
+    shebang = entry_lines[0] if entry_lines and entry_lines[0].startswith("#!") else ""
+
+    # Preserve module docstring (exact source) if present.
+    docstring_src = ""
+    if entry_ast.body and isinstance(entry_ast.body[0], ast.Expr) and isinstance(
+        getattr(entry_ast.body[0], "value", None), ast.Constant
+    ) and isinstance(getattr(entry_ast.body[0].value, "value", None), str):
+        docstring_src = _node_source(entry_lines, entry_ast.body[0])
+
+    future_imports: list[str] = []
+    entry_external_imports: list[str] = []
+    entry_body_parts: list[str] = []
+
+    # These are used to generate alias bindings for removed nemotron imports.
+    entry_alias_assignments: list[str] = []
+    entry_module_aliases: list[tuple[str, str]] = []  # (module, asname)
+    entry_dependencies: list[str] = []
+
+    for node in entry_ast.body:
+        # Skip shebang/docstring handled above.
+        if node is entry_ast.body[0] and docstring_src:
+            continue
+
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            future_imports.append(_node_source(entry_lines, node))
+            continue
+
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if _is_nemotron_import(node, package_prefix=package_prefix):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    entry_dependencies.append(node.module)
+                    for alias in node.names:
+                        if alias.name == "*":
+                            raise ValueError(
+                                f"Star import not supported in SelfContainedPackager: {entry_path}"
+                            )
+                        if alias.asname and alias.asname != alias.name:
+                            entry_alias_assignments.append(f"{alias.asname} = {alias.name}\n")
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.asname:
+                            entry_module_aliases.append((alias.name, alias.asname))
+                        entry_dependencies.append(alias.name)
+                continue
+
+            entry_external_imports.append(_node_source(entry_lines, node))
+            continue
+
+        entry_body_parts.append(_node_source(entry_lines, node))
+
+    # DFS inline modules with dependencies-first ordering.
+    module_blocks: dict[str, _ModuleInline] = {}
+    ordered_modules: list[str] = []
+
+    def visit(module: str, *, stack: set[str]) -> None:
+        if module in module_blocks:
+            return
+        if module in stack:
+            return
+        stack.add(module)
+        mod_inline, deps = _parse_module_for_inlining(
+            module,
+            repo_root=repo_root,
+            package_prefix=package_prefix,
+        )
+        for dep in deps:
+            if dep == package_prefix or dep.startswith(package_prefix + "."):
+                visit(dep, stack=stack)
+        module_blocks[module] = mod_inline
+        ordered_modules.append(module)
+        stack.remove(module)
+
+    for dep in entry_dependencies:
+        if dep == package_prefix or dep.startswith(package_prefix + "."):
+            visit(dep, stack=set())
+
+    need_namespace = bool(ordered_modules)
+    namespace_prelude = (
+        "import types\n__nemotron_namespaces: dict[str, types.SimpleNamespace] = {}\n"
+        if need_namespace
+        else ""
+    )
+
+    # Generate entry module-alias bindings (these will run after namespaces are built).
+    for mod, asname in entry_module_aliases:
+        entry_alias_assignments.append(f"{asname} = __nemotron_namespaces['{mod}']\n")
+
+    # Collect and dedupe external imports from entry + modules.
+    external_imports: list[str] = []
+    seen_imports: set[str] = set()
+
+    def add_imports(import_lines: list[str]) -> None:
+        for s in import_lines:
+            key = s.strip()
+            if not key:
+                continue
+            if key not in seen_imports:
+                external_imports.append(s)
+                seen_imports.add(key)
+
+    add_imports(entry_external_imports)
+    for mod in ordered_modules:
+        add_imports(module_blocks[mod].external_imports)
+
+    # Assemble output.
+    out: list[str] = []
+    if shebang:
+        out.append(shebang)
+    if docstring_src:
+        out.append(docstring_src)
+    out.extend(future_imports)
+    out.extend(external_imports)
+    if namespace_prelude:
+        out.append(namespace_prelude)
+
+    # Emit inlined modules.
+    for mod in ordered_modules:
+        blk = module_blocks[mod]
+        out.append(f"\n# --- begin inlined module: {mod} ---\n")
+        if blk.prelude_assignments:
+            out.extend(blk.prelude_assignments)
+        if blk.body:
+            out.append(blk.body)
+        out.append(f"\n# --- end inlined module: {mod} ---\n")
+
+        if namespace_prelude:
+            exports = sorted(blk.exports)
+            if exports:
+                args = ", ".join(f"{n}={n}" for n in exports)
+                out.append(
+                    f"__nemotron_namespaces['{mod}'] = types.SimpleNamespace({args})\n"
+                )
+            else:
+                out.append(f"__nemotron_namespaces['{mod}'] = types.SimpleNamespace()\n")
+
+    if entry_alias_assignments:
+        out.append("\n# Bind aliases for removed nemotron imports\n")
+        out.extend(entry_alias_assignments)
+
+    out.append("\n# --- entry script body ---\n")
+    out.append("".join(entry_body_parts))
+    return "".join(out)

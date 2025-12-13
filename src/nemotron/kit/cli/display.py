@@ -15,8 +15,21 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.tree import Tree
 
+from nemotron.kit.cli.env import get_cli_config
+
 # Global console instance
 CONSOLE = Console()
+
+# Default theme for syntax highlighting
+DEFAULT_THEME = "monokai"
+
+
+def _get_theme() -> str:
+    """Get the syntax highlighting theme from env.toml or use default."""
+    cli_config = get_cli_config()
+    if cli_config and "theme" in cli_config:
+        return str(cli_config.theme)
+    return DEFAULT_THEME
 
 
 def display_job_config(job_config: DictConfig) -> None:
@@ -28,7 +41,7 @@ def display_job_config(job_config: DictConfig) -> None:
         job_config: The compiled job configuration
     """
     CONSOLE.print()
-    CONSOLE.print("[bold cyan]Dry Run - Compiled Configuration[/bold cyan]")
+    CONSOLE.print("[bold cyan]Compiled Configuration[/bold cyan]")
     CONSOLE.print()
 
     # Display run section (contains recipe, env, cli)
@@ -49,7 +62,7 @@ def _display_run_section(job_config: DictConfig) -> None:
     # Convert to YAML string
     yaml_str = OmegaConf.to_yaml(run, resolve=False)
 
-    syntax = Syntax(yaml_str.rstrip(), "yaml", theme="monokai", line_numbers=False)
+    syntax = Syntax(yaml_str.rstrip(), "yaml", theme=_get_theme(), line_numbers=False)
     CONSOLE.print(Panel(
         syntax,
         title="[bold green]run[/bold green]",
@@ -72,7 +85,7 @@ def _display_config_section(job_config: DictConfig) -> None:
     config_without_run = OmegaConf.create(config_dict)
     yaml_str = OmegaConf.to_yaml(config_without_run, resolve=False)
 
-    syntax = Syntax(yaml_str.rstrip(), "yaml", theme="monokai", line_numbers=False)
+    syntax = Syntax(yaml_str.rstrip(), "yaml", theme=_get_theme(), line_numbers=False)
     CONSOLE.print(Panel(
         syntax,
         title="[bold green]config[/bold green]",

@@ -315,6 +315,34 @@ wandb:
 | `tags` | list | `[]` | Tags for filtering runs |
 | `notes` | str | - | Notes/description for the run |
 
+## CLI Display Settings
+
+You can customize how the CLI displays configuration output using the `[cli]` section:
+
+```toml
+# run.toml or env.toml
+
+[cli]
+theme = "github-light"
+```
+
+The `theme` setting controls the syntax highlighting theme used when displaying compiled configurations. This applies to both `--dry-run` output and regular execution.
+
+### Available Themes
+
+Any Pygments theme is supported. Popular choices include:
+
+| Theme | Description |
+|-------|-------------|
+| `monokai` | Dark theme (default) |
+| `github-light` | Light theme matching GitHub |
+| `github-dark` | Dark theme matching GitHub |
+| `dracula` | Popular dark theme |
+| `one-dark` | Atom One Dark theme |
+| `nord` | Nord color palette |
+| `solarized-dark` | Solarized dark |
+| `solarized-light` | Solarized light |
+
 ## Execution Profile Reference
 
 | Field | Type | Default | Description |

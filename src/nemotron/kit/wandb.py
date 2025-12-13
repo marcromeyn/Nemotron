@@ -24,7 +24,10 @@ Example:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -169,3 +172,116 @@ def finish_wandb(exit_code: int = 0) -> None:
             wandb.finish(exit_code=exit_code)
     except ImportError:
         pass
+
+
+_HTTP_HANDLER_PATCHED = False
+_WANDB_INIT_PATCHED = False
+_LINEAGE_REGISTERED = False
+_PENDING_ARTIFACT_QUALIFIED_NAMES: set[str] = set()
+_PENDING_TAGS: set[str] = set()
+
+
+def patch_wandb_http_handler_skip_digest_verification() -> None:
+    """Best-effort patch to skip digest verification for HTTP reference artifacts.
+
+    Some reference artifact backends (e.g. HuggingFace URLs) can return varying ETags
+    over time, causing W&B to reject downloads due to digest mismatch.
+    """
+    global _HTTP_HANDLER_PATCHED
+    if _HTTP_HANDLER_PATCHED:
+        return
+
+    try:
+        from wandb.sdk.artifacts.storage_handlers import http_handler
+
+        original_load_path = http_handler.HTTPHandler.load_path
+
+        def patched_load_path(self, manifest_entry, local: bool = False):
+            import os
+            import tempfile
+
+            import requests
+
+            url = getattr(manifest_entry, "ref", None)
+            if url is None:
+                return original_load_path(self, manifest_entry, local=local)
+
+            path = getattr(manifest_entry, "path", None)
+            if local or path is None:
+                fd, tmp_path = tempfile.mkstemp()
+                os.close(fd)
+                path = tmp_path
+
+            response = requests.get(url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            with open(path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            return path
+
+        http_handler.HTTPHandler.load_path = patched_load_path
+        _HTTP_HANDLER_PATCHED = True
+        logger.debug("Patched wandb HTTP handler to skip digest verification")
+    except Exception as e:
+        logger.warning(f"Failed to patch wandb HTTP handler: {e}")
+
+
+def patch_wandb_init_for_lineage(
+    *,
+    artifact_qualified_names: list[str],
+    tags: list[str] | None = None,
+) -> None:
+    """Patch `wandb.init()` so that, once a run is active, lineage is registered.
+
+    Intended for setups where another library owns `wandb.init()` (e.g. Megatron-Bridge)
+    but this project resolves artifacts before that init happens.
+    """
+    global _WANDB_INIT_PATCHED
+
+    if artifact_qualified_names:
+        _PENDING_ARTIFACT_QUALIFIED_NAMES.update(map(str, artifact_qualified_names))
+    if tags:
+        _PENDING_TAGS.update(map(str, tags))
+
+    if _WANDB_INIT_PATCHED:
+        return
+
+    import wandb
+
+    original_init = wandb.init
+
+    def patched_init(*args, **kwargs):
+        result = original_init(*args, **kwargs)
+        _register_lineage_if_possible()
+        return result
+
+    wandb.init = patched_init
+    _WANDB_INIT_PATCHED = True
+    logger.debug("Patched wandb.init for lineage registration")
+
+
+def _register_lineage_if_possible() -> None:
+    global _LINEAGE_REGISTERED
+    if _LINEAGE_REGISTERED:
+        return
+
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    if wandb.run is None:
+        return
+
+    if _PENDING_TAGS:
+        add_wandb_tags(sorted(_PENDING_TAGS))
+
+    for qname in sorted(_PENDING_ARTIFACT_QUALIFIED_NAMES):
+        try:
+            wandb.run.use_artifact(qname)
+        except Exception as e:
+            logger.warning(f"Failed to register artifact lineage for {qname}: {e}")
+
+    _LINEAGE_REGISTERED = True

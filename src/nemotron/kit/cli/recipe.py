@@ -46,6 +46,7 @@ class RecipeMetadata:
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     torchrun: bool = True
     ray: bool = False
+    packager: str = "pattern"
 
 
 def recipe(
@@ -57,6 +58,7 @@ def recipe(
     *,
     torchrun: bool = True,
     ray: bool = False,
+    packager: str = "pattern",
 ) -> Callable:
     """Decorator marking a function as a recipe command.
 
@@ -183,16 +185,18 @@ def recipe(
             # Build full job config
             builder.build_job_config()
 
+            # Display compiled configuration
+            display_job_config(builder.job_config)
+
             # Handle dry-run mode
             if global_ctx.dry_run:
-                display_job_config(builder.job_config)
                 return
 
             # Save configs
             job_path, train_path = builder.save()
 
-            # Build env vars for display
-            env_vars = _build_env_vars()
+            # Build env vars for display (needs job_config for wandb settings)
+            env_vars = _build_env_vars(builder.job_config)
 
             # Display job submission summary
             display_job_submission(job_path, train_path, env_vars, global_ctx.mode)
@@ -211,6 +215,7 @@ def recipe(
                     env_vars=env_vars,
                     torchrun=torchrun,
                     ray=ray,
+                    packager=packager,
                 )
 
         # Attach metadata to function for introspection
@@ -222,6 +227,7 @@ def recipe(
             artifacts=artifacts,
             torchrun=torchrun,
             ray=ray,
+            packager=packager,
         )
 
         return wrapper
@@ -281,6 +287,7 @@ def _execute_nemo_run(
     *,
     torchrun: bool = True,
     ray: bool = False,
+    packager: str = "pattern",
 ) -> None:
     """Execute script via nemo-run.
 
@@ -310,7 +317,10 @@ def _execute_nemo_run(
     # Build executor with flat file layout (main.py, config.yaml)
     executor = _build_executor(
         env_config, job_config, script_path, train_path, job_dir, env_vars,
-        torchrun=torchrun, ray=ray, attached=attached,
+        torchrun=torchrun,
+        ray=ray,
+        attached=attached,
+        packager=packager,
     )
 
     # Script args use flat names on remote
@@ -343,6 +353,7 @@ def _build_executor(
     torchrun: bool = True,
     ray: bool = False,
     attached: bool = True,
+    packager: str = "pattern",
 ) -> Any:
     """Build nemo-run executor from env config.
 
@@ -386,7 +397,12 @@ def _build_executor(
             )
 
         # Build packager with flat file layout (main.py, config.yaml)
-        packager = _build_packager(script_path, train_path, job_dir)
+        packager = _build_packager(
+            script_path,
+            train_path,
+            job_dir,
+            packager=packager,
+        )
 
         # Container image can be specified as "container" or "container_image"
         container_image = env_config.get("container_image") or env_config.get("container")
@@ -432,17 +448,22 @@ def _build_executor(
         raise ValueError(f"Unknown executor type: {executor_type}")
 
 
-def _build_env_vars() -> dict:
+def _build_env_vars(job_config: Any) -> dict:
     """Build environment variables for nemo-run execution.
 
     Sets up:
     - NEMO_RUN_DIR for output paths
     - HF_TOKEN if logged in to HuggingFace
-    - WANDB_API_KEY if logged in to W&B
+    - WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT if logged in to W&B
+
+    Args:
+        job_config: Full job configuration (contains run.wandb section)
 
     Returns:
         Dictionary of environment variables
     """
+    from omegaconf import OmegaConf
+
     env_vars: dict[str, str] = {}
 
     # Set NEMO_RUN_DIR to experiment root for output paths
@@ -468,40 +489,64 @@ def _build_env_vars() -> dict:
     except Exception:
         pass
 
+    # Extract W&B entity and project from job config
+    try:
+        if hasattr(job_config, "run") and hasattr(job_config.run, "wandb"):
+            wandb_config = OmegaConf.to_container(job_config.run.wandb, resolve=True)
+            if wandb_config.get("entity"):
+                env_vars["WANDB_ENTITY"] = str(wandb_config["entity"])
+            if wandb_config.get("project"):
+                env_vars["WANDB_PROJECT"] = str(wandb_config["project"])
+    except Exception:
+        pass
+
     return env_vars
 
 
-def _build_packager(script_path: str, train_path: Path, job_dir: Path) -> Any:
-    """Build a packager for minimal file syncing.
+def _build_packager(
+    script_path: str,
+    train_path: Path,
+    job_dir: Path,
+    *,
+    packager: str = "pattern",
+) -> Any:
+    """Build a packager for file syncing.
 
-    Creates a flat structure on the remote:
-    - main.py (the train script)
-    - config.yaml (the train config)
-
-    Args:
-        script_path: Path to the training script
-        train_path: Path to the train.yaml config
-        job_dir: Job directory where we can create symlinks
-
-    Returns:
-        A PatternPackager that syncs the flat file layout.
+    Packager types:
+    - "pattern": Minimal sync of `main.py` + `config.yaml` only (default)
+    - "code": Full codebase sync with exclusions (for Ray jobs needing local imports)
+    - "self_contained": Inlines `nemotron.*` imports into a single script
     """
     import shutil
 
     from nemo_run.core.packaging import PatternPackager
 
-    # Create flat copies in job directory
+    if packager == "self_contained":
+        from nemotron.kit.packaging import SelfContainedPackager
+
+        return SelfContainedPackager(
+            script_path=script_path,
+            train_path=train_path,
+        )
+
+    if packager == "code":
+        from nemotron.kit.packaging import CodePackager
+
+        return CodePackager(
+            script_path=script_path,
+            train_path=train_path,
+            exclude_dirs=("usage-cookbook", "use-case-examples"),
+        )
+
+    if packager != "pattern":
+        raise ValueError(f"Unknown packager: {packager}")
+
     code_dir = job_dir / "code"
     code_dir.mkdir(exist_ok=True)
 
-    # Copy script as main.py
     shutil.copy2(script_path, code_dir / "main.py")
-
-    # Copy config as config.yaml
     shutil.copy2(train_path, code_dir / "config.yaml")
 
-    # Use PatternPackager to sync the flat files
-    # include_pattern must be absolute paths, relative_path is the base for tarball structure
     main_path = str(code_dir / "main.py")
     config_path = str(code_dir / "config.yaml")
     return PatternPackager(
