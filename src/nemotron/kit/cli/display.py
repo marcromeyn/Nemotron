@@ -140,3 +140,49 @@ def display_job_submission(
     CONSOLE.print(Panel(tree, border_style="green", expand=False))
     CONSOLE.print()
 
+
+def display_ray_job_submission(
+    script_path: str,
+    script_args: list[str],
+    env_vars: dict[str, str],
+    mode: str,
+) -> None:
+    """Display Ray job submission summary as a Rich tree panel.
+
+    Args:
+        script_path: Path to the script being executed
+        script_args: Arguments passed to the script
+        env_vars: Environment variables being set
+        mode: Execution mode (attached/detached)
+    """
+    # Build tree
+    tree = Tree("[bold]Job Submission[/bold]")
+
+    # Script section
+    script_section = tree.add("[cyan]script[/cyan]")
+    script_section.add(f"[dim]path:[/dim] {script_path}")
+    if script_args:
+        script_section.add(f"[dim]args:[/dim] {' '.join(script_args)}")
+
+    # Environment variables section (if any interesting ones)
+    interesting_vars = {k: v for k, v in env_vars.items() if k not in ("NEMO_RUN_DIR",)}
+    if interesting_vars:
+        env_section = tree.add("[cyan]env[/cyan]")
+        for key in sorted(interesting_vars.keys()):
+            # Mask sensitive values
+            if "KEY" in key or "TOKEN" in key or "SECRET" in key:
+                env_section.add(f"[dim]{key}:[/dim] [green]✓ detected[/green]")
+            else:
+                env_section.add(f"[dim]{key}:[/dim] {interesting_vars[key]}")
+
+    # Mode indicator
+    mode_label = {
+        "attached": "[yellow]attached[/yellow]",
+        "detached": "[blue]detached[/blue]",
+    }.get(mode, mode)
+    tree.add(f"[cyan]mode:[/cyan] {mode_label}")
+
+    CONSOLE.print()
+    CONSOLE.print(Panel(tree, border_style="green", expand=False))
+    CONSOLE.print()
+

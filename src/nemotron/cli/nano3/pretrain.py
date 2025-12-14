@@ -19,6 +19,7 @@ CONFIG_DIR = "src/nemotron/recipes/nano3/stage0_pretrain/config"
     script_path=SCRIPT_PATH,
     config_dir=CONFIG_DIR,
     default_config="default",
+    packager="self_contained",
     artifacts={
         "data": {
             "default": "DataBlendsArtifact-pretrain",

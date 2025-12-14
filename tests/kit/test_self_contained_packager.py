@@ -47,7 +47,7 @@ def test_self_contained_packager_produces_flat_tar(tmp_path):
     with patch("nemo_run.core.packaging.pattern.Context", MockContext):
         packager = SelfContainedPackager(
             script_path=str(script_path.relative_to(repo_root)),
-            train_path=train_cfg,
+            train_path=str(train_cfg),
         )
         tar_path = packager.package(repo_root, str(out_dir), "pkg")
 

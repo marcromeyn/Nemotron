@@ -13,6 +13,27 @@
       "subset": "4plus",
       "text_field": "text",
       "weight": 1.0
+    },
+    {
+      "name": "nemotron-math-4plus-mind",
+      "path": "hf://nvidia/Nemotron-CC-Math-v1",
+      "subset": "4plus_MIND",
+      "text_field": "text",
+      "weight": 1.0
+    },
+    {
+      "name": "nemotron-cc-v2-diverse-qa",
+      "path": "hf://nvidia/Nemotron-CC-v2",
+      "subset": "Diverse-QA",
+      "text_field": "text",
+      "weight": 1.0
+    },
+    {
+      "name": "nemotron-cc-v2-high-quality",
+      "path": "hf://nvidia/Nemotron-CC-v2",
+      "subset": "High-Quality",
+      "text_field": "text",
+      "weight": 1.0
     }
   ]
 }

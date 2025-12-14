@@ -61,6 +61,11 @@ class GlobalOptions:
         ),
     ] = None
 
+    dry_run: Annotated[
+        bool,
+        tyro.conf.arg(name="dry-run", help="Print configuration and exit without executing"),
+    ] = False
+
     # W&B options (flattened for single section display)
     wandb_project: Annotated[
         str | None,
@@ -570,6 +575,13 @@ class App:
                 config, art_refs, stdin_artifacts, artifacts
             )
 
+        # Display compiled configuration (always, like pretrain)
+        _display_config(config, global_options)
+
+        # Handle dry-run mode
+        if global_options is not None and global_options.dry_run:
+            return
+
         # Initialize wandb from global options or run.toml
         if global_options is not None and global_options.wandb_project is not None:
             # CLI args take precedence
@@ -981,6 +993,316 @@ def _append_wandb_args(args: list[str], wandb_config: WandbConfig) -> list[str]:
     return result
 
 
+def _display_config(config: Any, global_options: GlobalOptions | None) -> None:
+    """Display the compiled configuration as syntax-highlighted YAML.
+
+    Mimics display_job_config() but works with dataclasses instead of OmegaConf.
+
+    Args:
+        config: The parsed config dataclass
+        global_options: Global CLI options (for wandb config display)
+    """
+    from dataclasses import asdict, is_dataclass
+
+    import yaml
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    from nemotron.kit.cli.env import get_cli_config
+    from nemotron.kit.run import load_wandb_config
+
+    console = Console()
+
+    # Get theme from env.toml or use default
+    cli_config = get_cli_config()
+    theme = str(cli_config.theme) if cli_config and "theme" in cli_config else "monokai"
+
+    console.print()
+    console.print("[bold cyan]Compiled Configuration[/bold cyan]")
+    console.print()
+
+    # Build run section with wandb info
+    run_info: dict[str, Any] = {}
+
+    # Get wandb config from CLI args or env.toml
+    if global_options is not None and global_options.wandb_project is not None:
+        wandb = global_options.to_wandb_config()
+        run_info["wandb"] = {
+            "project": wandb.project,
+            "entity": wandb.entity,
+        }
+    else:
+        wandb_config = load_wandb_config()
+        if wandb_config is not None and wandb_config.project:
+            run_info["wandb"] = {
+                "project": wandb_config.project,
+                "entity": wandb_config.entity,
+            }
+
+    if run_info:
+        yaml_str = yaml.dump(run_info, default_flow_style=False, sort_keys=False)
+        syntax = Syntax(yaml_str.rstrip(), "yaml", theme=theme, line_numbers=False)
+        console.print(Panel(
+            syntax,
+            title="[bold green]run[/bold green]",
+            border_style="green",
+            expand=False,
+        ))
+        console.print()
+
+    # Display config
+    if is_dataclass(config):
+        config_dict = asdict(config)
+        # Convert Path objects to strings for YAML serialization
+        config_dict = _convert_paths_to_strings(config_dict)
+        yaml_str = yaml.dump(config_dict, default_flow_style=False, sort_keys=False)
+        syntax = Syntax(yaml_str.rstrip(), "yaml", theme=theme, line_numbers=False)
+        console.print(Panel(
+            syntax,
+            title="[bold green]config[/bold green]",
+            border_style="green",
+            expand=False,
+        ))
+        console.print()
+
+
+def _convert_paths_to_strings(obj: Any) -> Any:
+    """Recursively convert Path objects to strings for YAML serialization."""
+    if isinstance(obj, Path):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_paths_to_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_paths_to_strings(item) for item in obj]
+    return obj
+
+
+def _get_script_config_path(subcommand_parts: list[str]) -> Path | None:
+    """Get the config file path for a script based on subcommand.
+
+    Args:
+        subcommand_parts: CLI subcommand parts (e.g., ['data', 'prep', 'pretrain'])
+
+    Returns:
+        Path to the config file or None if not a configurable script.
+    """
+    # Normalize: skip 'nano3' prefix if present
+    parts = subcommand_parts
+    if parts and parts[0] == "nano3":
+        parts = parts[1:]
+
+    # Handle data prep commands: ['data', 'prep', 'pretrain'] -> stage0_pretrain/config/data_prep.yaml
+    if len(parts) >= 3 and parts[0] == "data" and parts[1] == "prep":
+        stage = parts[2]  # e.g., "pretrain", "sft", "rl"
+
+        stage_map = {
+            "pretrain": "stage0_pretrain",
+            "sft": "stage1_sft",
+            "rl": "stage2_rl",
+        }
+        stage_dir = stage_map.get(stage)
+        if stage_dir is None:
+            return None
+
+        # Build config path relative to cwd
+        return Path(f"src/nemotron/recipes/nano3/{stage_dir}/config/data_prep.yaml")
+
+    return None
+
+
+def _display_script_config(
+    subcommand_parts: list[str],
+    script_args: list[str],
+    console: Any,
+    theme: str,
+) -> None:
+    """Display the script configuration as syntax-highlighted YAML.
+
+    Loads the script's config file and applies CLI overrides to show
+    the effective configuration that will be used.
+
+    Args:
+        subcommand_parts: CLI subcommand parts (e.g., ['data', 'prep', 'pretrain'])
+        script_args: Script arguments (e.g., ['--sample', '10000', '--force'])
+        console: Rich console instance
+        theme: Syntax highlighting theme
+    """
+    import yaml
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    # Get config file path for this script
+    config_path = _get_script_config_path(subcommand_parts)
+    if config_path is None or not config_path.exists():
+        return
+
+    try:
+        from nemotron.kit.train_script import (
+            apply_hydra_overrides,
+            load_omegaconf_yaml,
+        )
+        from omegaconf import OmegaConf
+
+        # Load base config
+        config = load_omegaconf_yaml(config_path)
+
+        # CLI flags that are NOT config overrides (handled by CLI framework)
+        cli_only_flags = {"dry-run", "run", "batch", "config"}
+
+        # Parse script_args into overrides
+        # Handle both --key value and key=value formats
+        overrides = []
+        i = 0
+        while i < len(script_args):
+            arg = script_args[i]
+            if arg.startswith("--"):
+                # --key value format: convert to key=value
+                key = arg[2:]  # Remove --
+
+                # Skip CLI-only flags that aren't config fields
+                if key in cli_only_flags:
+                    i += 1
+                    continue
+
+                if i + 1 < len(script_args) and not script_args[i + 1].startswith("-"):
+                    value = script_args[i + 1]
+                    # Convert --sample 10000 to sample=10000
+                    overrides.append(f"{key}={value}")
+                    i += 2
+                else:
+                    # Boolean flag like --force
+                    overrides.append(f"{key}=true")
+                    i += 1
+            elif "=" in arg:
+                # key=value format: use directly
+                overrides.append(arg)
+                i += 1
+            else:
+                i += 1
+
+        # Apply overrides
+        config = apply_hydra_overrides(config, overrides)
+
+        # Convert to YAML for display (resolve interpolations)
+        yaml_str = OmegaConf.to_yaml(config, resolve=True)
+
+        syntax = Syntax(yaml_str.rstrip(), "yaml", theme=theme, line_numbers=False)
+        console.print(Panel(
+            syntax,
+            title="[bold green]config[/bold green]",
+            border_style="green",
+            expand=False,
+        ))
+        console.print()
+
+    except Exception:
+        # Silently skip config display on any error
+        pass
+
+
+def _display_run_config(
+    profile: Any,
+    run_name: str,
+    wandb_config: WandbConfig | None,
+    remaining_args: list[str],
+    is_launch: bool,
+) -> None:
+    """Display the run configuration as syntax-highlighted YAML.
+
+    Args:
+        profile: The RunConfig profile
+        run_name: Name of the run profile
+        wandb_config: Optional wandb config from env.toml
+        remaining_args: CLI arguments (for showing command)
+        is_launch: Whether running in batch/launch mode
+    """
+    import sys
+
+    import yaml
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    from nemotron.kit.cli.env import get_cli_config
+
+    console = Console()
+
+    # Get theme from env.toml or use default
+    cli_config = get_cli_config()
+    theme = str(cli_config.theme) if cli_config and "theme" in cli_config else "monokai"
+
+    console.print()
+    console.print("[bold cyan]Compiled Configuration[/bold cyan]")
+    console.print()
+
+    # Build run section
+    run_info: dict[str, Any] = {
+        "mode": "batch" if is_launch else "run",
+        "profile": run_name,
+        "env": {
+            "executor": profile.executor,
+        },
+    }
+
+    # Add all non-None env fields from the profile
+    # These are all the Slurm/executor-related fields
+    env_fields = [
+        "account", "partition", "run_partition", "batch_partition", "time",
+        "job_name", "nodes", "nproc_per_node", "ntasks_per_node", "gpus_per_node",
+        "mem", "exclusive", "cpus_per_task", "cpus_per_gpu", "gpus_per_task",
+        "mem_per_gpu", "mem_per_cpu", "qos", "constraint", "exclude", "gres", "array",
+        "tunnel", "host", "user", "identity", "remote_job_dir",
+        "container_image", "mounts",
+    ]
+    for field_name in env_fields:
+        value = getattr(profile, field_name, None)
+        # Skip None values and default "local" tunnel
+        if value is None:
+            continue
+        if field_name == "tunnel" and value == "local":
+            continue
+        # Skip empty lists
+        if isinstance(value, list) and not value:
+            continue
+        run_info["env"][field_name] = value
+
+    # Add CLI info - extract script args (everything after subcommand)
+    # Stop at first flag OR key=value override (Hydra-style)
+    subcommand_parts = []
+    script_args = []
+    for i, arg in enumerate(remaining_args):
+        if arg.startswith("-") or "=" in arg:
+            script_args = remaining_args[i:]
+            break
+        subcommand_parts.append(arg)
+
+    run_info["cli"] = {
+        "argv": sys.argv,
+        "script_args": script_args if script_args else None,
+    }
+
+    # Add wandb config if available
+    if wandb_config is not None and wandb_config.project:
+        run_info["wandb"] = {
+            "project": wandb_config.project,
+            "entity": wandb_config.entity,
+        }
+
+    yaml_str = yaml.dump(run_info, default_flow_style=False, sort_keys=False)
+    syntax = Syntax(yaml_str.rstrip(), "yaml", theme=theme, line_numbers=False)
+    console.print(Panel(
+        syntax,
+        title="[bold green]run[/bold green]",
+        border_style="green",
+        expand=False,
+    ))
+    console.print()
+
+    # Display data prep config panel if this is a data prep command
+    _display_script_config(subcommand_parts, script_args, console, theme)
+
+
 def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_args: list[str], is_launch: bool = False, app: "App | None" = None) -> None:
     """Execute command via nemo-run with the specified profile.
 
@@ -1006,10 +1328,8 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
     # This allows different partitions for attached vs detached execution
     profile.partition = resolve_partition(profile, is_launch)
 
-    # Load wandb config and append CLI args for remote execution
+    # Load wandb config for potential use later
     wandb_config = load_wandb_config()
-    if wandb_config is not None and wandb_config.enabled:
-        remaining_args = _append_wandb_args(remaining_args, wandb_config)
 
     # Apply CLI overrides
     for key, value in overrides.items():
@@ -1026,11 +1346,21 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
         else:
             raise ValueError(f"Unknown run config field: {key}")
 
+    # Check for --dry-run in remaining args
+    dry_run = "--dry-run" in remaining_args
+
+    # Display compiled configuration (like pretrain does)
+    _display_run_config(profile, run_name, wandb_config, remaining_args, is_launch)
+
+    # Handle dry-run mode
+    if dry_run:
+        return
+
     # Build descriptive experiment name from subcommand path
-    # Extract subcommand parts (stop at first flag)
+    # Extract subcommand parts (stop at first flag OR key=value override)
     subcommand_parts = []
     for arg in remaining_args:
-        if arg.startswith("-"):
+        if arg.startswith("-") or "=" in arg:
             break
         subcommand_parts.append(arg)
     experiment_name = "-".join(subcommand_parts) if subcommand_parts else run_name
@@ -1041,14 +1371,21 @@ def _execute_with_nemo_run(run_name: str, overrides: dict[str, str], remaining_a
     # Check if target module has RAY = True
     use_ray = _check_module_ray_flag(subcommand_parts)
 
+    # For non-Ray jobs, append wandb CLI args if configured.
+    # Ray jobs get wandb config from env vars (WANDB_PROJECT, WANDB_ENTITY)
+    # set in the Ray runtime_env, so we don't append CLI args.
+    if not use_ray and wandb_config is not None and wandb_config.enabled:
+        remaining_args = _append_wandb_args(remaining_args, wandb_config)
+
     if use_ray:
         # Use Ray execution path via run_with_nemo_run
         if direct_script_path:
-            # Direct script execution - script path relative to /nemo_run/code
-            container_script_path = f"/nemo_run/code/{direct_script_path}"
+            # Direct script execution - use relative path from workdir
+            # nemo-run's SlurmRayJob rsyncs to {cluster_dir}/code and sets workdir there
+            # so we can use relative paths directly (no /nemo_run mount for Ray jobs)
             script_args = remaining_args[len(subcommand_parts):]
             run_with_nemo_run(
-                script_path=container_script_path,
+                script_path=direct_script_path,
                 script_args=script_args,
                 run_config=profile,
                 ray=True,

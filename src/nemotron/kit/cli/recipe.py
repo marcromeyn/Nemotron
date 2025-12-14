@@ -6,6 +6,7 @@ for recipe commands.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -123,6 +124,15 @@ def recipe(
             global_ctx.dotlist = dotlist
             global_ctx.passthrough = passthrough
 
+            # Validate options after split_unknown_args has extracted all global options
+            if global_ctx.run and global_ctx.batch:
+                typer.echo("Error: --run and --batch cannot both be set", err=True)
+                raise typer.Exit(1)
+
+            if global_ctx.stage and not global_ctx.profile:
+                typer.echo("Error: --stage requires --run or --batch to specify target cluster", err=True)
+                raise typer.Exit(1)
+
             is_bare = (
                 global_ctx.config is None
                 and global_ctx.profile is None
@@ -194,6 +204,18 @@ def recipe(
 
             # Save configs
             job_path, train_path = builder.save()
+
+            # Handle stage-only mode
+            if global_ctx.stage:
+                _execute_stage_only(
+                    script_path=script_path,
+                    train_path=train_path,
+                    job_dir=builder.job_dir,
+                    job_config=builder.job_config,
+                    packager=packager,
+                    torchrun=torchrun,
+                )
+                return
 
             # Build env vars for display (needs job_config for wandb settings)
             env_vars = _build_env_vars(builder.job_config)
@@ -526,7 +548,7 @@ def _build_packager(
 
         return SelfContainedPackager(
             script_path=script_path,
-            train_path=train_path,
+            train_path=str(train_path),
         )
 
     if packager == "code":
@@ -534,7 +556,7 @@ def _build_packager(
 
         return CodePackager(
             script_path=script_path,
-            train_path=train_path,
+            train_path=str(train_path),
             exclude_dirs=("usage-cookbook", "use-case-examples"),
         )
 
@@ -625,3 +647,226 @@ def _ensure_squashed_image(tunnel: Any, container_image: str, remote_job_dir: st
 
     console.print(f"[green]✓[/green] Created squashed image: [cyan]{sqsh_path}[/cyan]")
     return sqsh_path
+
+
+def _execute_stage_only(
+    script_path: str,
+    train_path: Path,
+    job_dir: Path,
+    job_config: Any,
+    packager: str = "pattern",
+    *,
+    torchrun: bool = True,
+) -> None:
+    """Stage script + config to remote cluster without execution.
+
+    Stages files to a fixed location in remote_job_dir and prints
+    commands for interactive debugging.
+
+    Args:
+        script_path: Path to training script
+        train_path: Path to train.yaml config
+        job_dir: Local job directory
+        job_config: Full job configuration (contains run.env)
+        packager: Packager type ("pattern", "code", "self_contained")
+        torchrun: Whether to use torchrun launcher
+    """
+    from rich.panel import Panel
+    from rich.tree import Tree
+
+    try:
+        import nemo_run as run
+    except ImportError:
+        typer.echo("Error: nemo-run is required for --stage", err=True)
+        typer.echo("Install with: pip install nemo-run", err=True)
+        raise typer.Exit(1)
+
+    from omegaconf import OmegaConf
+
+    # Extract env config
+    env_config = OmegaConf.to_container(job_config.run.env, resolve=True)
+
+    # Only support SSH tunnel for now
+    tunnel_type = env_config.get("tunnel")
+    if tunnel_type != "ssh":
+        console.print("[red]Error:[/red] --stage requires SSH tunnel configuration (tunnel: ssh)")
+        raise typer.Exit(1)
+
+    remote_job_dir = env_config.get("remote_job_dir")
+    if not remote_job_dir:
+        console.print("[red]Error:[/red] remote_job_dir not configured in env profile")
+        raise typer.Exit(1)
+
+    # Fixed staging location for interactive debugging
+    stage_dir = f"{remote_job_dir}/interactive"
+
+    # Build tunnel
+    tunnel = run.SSHTunnel(
+        host=env_config.get("host", "localhost"),
+        user=env_config.get("user"),
+        job_dir=remote_job_dir,
+    )
+
+    # Connect
+    with console.status("[bold blue]Connecting to remote cluster..."):
+        tunnel.connect()
+
+    # Create remote directories
+    console.print(f"\n[cyan]Creating remote directory:[/cyan] {stage_dir}")
+    tunnel.run(f"mkdir -p {stage_dir}", hide=True)
+
+    # Stage files locally using the packager
+    # For self_contained packager, this will inline nemotron imports
+    code_dir = job_dir / "code"
+    code_dir.mkdir(exist_ok=True)
+
+    if packager == "self_contained":
+        from nemotron.kit.packaging import SelfContainedPackager
+        from nemotron.kit.packaging.self_contained_packager import inline_imports
+
+        # Inline imports to create main.py
+        script_file = Path(script_path)
+        if not script_file.is_absolute():
+            script_file = Path.cwd() / script_path
+
+        inlined = inline_imports(
+            script_file,
+            repo_root=Path.cwd(),
+            package_prefix="nemotron",
+        )
+        (code_dir / "main.py").write_text(inlined, encoding="utf-8")
+        shutil.copy2(train_path, code_dir / "config.yaml")
+    else:
+        # For pattern/code packagers, just copy files
+        shutil.copy2(script_path, code_dir / "main.py")
+        shutil.copy2(train_path, code_dir / "config.yaml")
+
+    local_script = code_dir / "main.py"
+    local_config = code_dir / "config.yaml"
+
+    # Build environment variables (same as _execute_nemo_run)
+    env_vars = _build_env_vars(job_config)
+
+    # Get GPU count for torchrun
+    gpus = env_config.get("gpus_per_node") or env_config.get("ntasks_per_node", 8)
+
+    # Create run.sh script that sets env vars and runs training
+    run_script_lines = ["#!/bin/bash", "# Auto-generated training script with environment setup", ""]
+    run_script_lines.append("# Environment variables for W&B and HuggingFace")
+    for key, value in env_vars.items():
+        # Escape single quotes in values
+        escaped_value = value.replace("'", "'\"'\"'")
+        run_script_lines.append(f"export {key}='{escaped_value}'")
+    run_script_lines.append("")
+    run_script_lines.append("# Run training")
+    if torchrun:
+        run_script_lines.append(f'torchrun --nproc_per_node={gpus} main.py --config config.yaml "$@"')
+    else:
+        run_script_lines.append('python main.py --config config.yaml "$@"')
+    run_script = "\n".join(run_script_lines) + "\n"
+    run_script_path = code_dir / "run.sh"
+    run_script_path.write_text(run_script)
+
+    # Upload files via scp/sftp
+    console.print(f"[cyan]Uploading files to:[/cyan] {stage_dir}")
+    with console.status("[bold blue]Uploading script, config, and run.sh..."):
+        tunnel.put(str(local_script), f"{stage_dir}/main.py")
+        tunnel.put(str(local_config), f"{stage_dir}/config.yaml")
+        tunnel.put(str(run_script_path), f"{stage_dir}/run.sh")
+        # Make run.sh executable
+        tunnel.run(f"chmod +x {stage_dir}/run.sh", hide=True)
+
+    console.print("[green]✓[/green] Files staged successfully\n")
+
+    # Build and display commands
+    _print_stage_commands(env_config, stage_dir, env_vars=env_vars, torchrun=torchrun)
+
+
+def _print_stage_commands(
+    env_config: dict,
+    stage_dir: str,
+    *,
+    env_vars: dict[str, str] | None = None,
+    torchrun: bool = True,
+) -> None:
+    """Print commands for interactive debugging after staging.
+
+    Args:
+        env_config: Environment configuration dict
+        stage_dir: Remote directory where files were staged
+        env_vars: Environment variables for W&B/HF (displayed to user)
+        torchrun: Whether to use torchrun launcher
+    """
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    host = env_config.get("host", "localhost")
+    user = env_config.get("user", "")
+    partition = env_config.get("run_partition") or env_config.get("partition", "interactive")
+    nodes = env_config.get("nodes", 1)
+    gpus = env_config.get("gpus_per_node") or env_config.get("ntasks_per_node", 8)
+    time_limit = env_config.get("time", "04:00:00")
+    container = env_config.get("container_image") or env_config.get("container")
+    account = env_config.get("account")
+    remote_job_dir = env_config.get("remote_job_dir")
+
+    # Get squashed container path
+    sqsh_path = None
+    if container and remote_job_dir:
+        sqsh_path = _get_squash_path(container, remote_job_dir)
+
+    # Mount to /workspace for simpler commands inside container
+    container_mount_path = "/workspace"
+
+    # Build srun command (multi-line for display)
+    srun_parts = ["srun"]
+    if account:
+        srun_parts.append(f"--account={account}")
+    srun_parts.extend([
+        f"--partition={partition}",
+        f"--nodes={nodes}",
+        f"--ntasks-per-node={gpus}",
+        f"--gpus-per-node={gpus}",
+        f"--time={time_limit}",
+    ])
+    if sqsh_path:
+        srun_parts.append(f"--container-image={sqsh_path}")
+        srun_parts.append(f"--container-mounts={stage_dir}:{container_mount_path},/lustre:/lustre")
+        srun_parts.append(f"--container-workdir={container_mount_path}")
+    srun_parts.append("--pty bash")
+    srun_cmd_display = " \\\n    ".join(srun_parts)
+    srun_cmd_oneline = " ".join(srun_parts)
+
+    # Build environment info for display
+    env_info = ""
+    if env_vars:
+        env_keys = []
+        for key in env_vars:
+            if key in ("WANDB_API_KEY", "HF_TOKEN"):
+                env_keys.append(f"{key}=***")
+            else:
+                env_keys.append(f"{key}={env_vars[key]}")
+        env_info = f"[bold cyan]Environment:[/bold cyan] {', '.join(env_keys)}\n"
+
+    # Display
+    console.print(Panel.fit(
+        f"[bold cyan]Files staged to:[/bold cyan] {stage_dir}\n"
+        f"[bold cyan]Mounted at:[/bold cyan] {container_mount_path}\n"
+        f"{env_info}\n"
+        f"[bold cyan]1. SSH to cluster:[/bold cyan]\n"
+        f"   [green]ssh {user}@{host}[/green]\n\n"
+        f"[bold cyan]2. Start interactive job:[/bold cyan]\n"
+        f"   [green]{srun_cmd_display}[/green]\n\n"
+        f"[bold cyan]3. Run training:[/bold cyan]\n"
+        f"   [green]./run.sh[/green]\n\n"
+        f"[dim]Tip: Keep the srun session alive while iterating. "
+        f"Re-run with --stage to update files, then run ./run.sh again.[/dim]",
+        title="[bold]Interactive Debugging[/bold]",
+        border_style="green",
+    ))
+
+    # Print single-line srun command for easy copying
+    # Use print() instead of console.print() to avoid Rich text wrapping
+    console.print("\n[bold cyan]Copy-paste srun command:[/bold cyan]")
+    print(srun_cmd_oneline)
+    print()

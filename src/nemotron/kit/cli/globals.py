@@ -30,6 +30,7 @@ class GlobalContext:
     run: Optional[str] = None
     batch: Optional[str] = None
     dry_run: bool = False
+    stage: bool = False
     dotlist: List[str] = field(default_factory=list)
     passthrough: List[str] = field(default_factory=list)
 
@@ -83,6 +84,7 @@ def split_unknown_args(
         "--batch": "batch",
         "-d": "dry_run",
         "--dry-run": "dry_run",
+        "--stage": "stage",
     }
 
     i = 0
@@ -92,7 +94,7 @@ def split_unknown_args(
         # Check if it's a global option
         if arg in global_opts:
             attr = global_opts[arg]
-            if attr == "dry_run":
+            if attr in ("dry_run", "stage"):
                 # Boolean flag
                 setattr(global_ctx, attr, True)
                 i += 1
@@ -141,13 +143,19 @@ def global_callback(
         "--dry-run",
         help="Print compiled config as rich table (no execution)",
     ),
+    stage: bool = typer.Option(
+        False,
+        "--stage",
+        help="Stage script + config to remote cluster for interactive debugging",
+    ),
 ) -> None:
     """Global callback that captures options available to all commands.
 
     This callback is invoked before any subcommand and stores the global
     options in ctx.obj for access by leaf commands.
     """
-    # Validate mutual exclusivity
+    # Validate mutual exclusivity (only if both are set at this point)
+    # Note: additional options may be extracted later by split_unknown_args
     if run and batch:
         typer.echo("Error: --run and --batch cannot both be set", err=True)
         raise typer.Exit(1)
@@ -158,6 +166,7 @@ def global_callback(
     ctx.obj.run = run
     ctx.obj.batch = batch
     ctx.obj.dry_run = dry_run
+    ctx.obj.stage = stage
 
     # Unknown args will be populated by the leaf command
     # since they need allow_extra_args=True on the command itself

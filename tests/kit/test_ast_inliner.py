@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nemotron.kit.packaging.ast_inliner import inline_imports
+from nemotron.kit.packaging.self_contained_packager import inline_imports
 
 
 def test_inline_imports_inlines_nemotron_modules_and_keeps_external_imports(tmp_path: Path):

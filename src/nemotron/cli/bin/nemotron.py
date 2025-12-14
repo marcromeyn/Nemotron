@@ -52,10 +52,15 @@ def main_callback(
         "--dry-run",
         help="Print compiled config as rich table (no execution)",
     ),
+    stage: bool = typer.Option(
+        False,
+        "--stage",
+        help="Stage script + config to remote cluster for interactive debugging",
+    ),
 ) -> None:
     """Nemotron CLI - Reproducible training recipes."""
     # Delegate to global_callback
-    global_callback(ctx, config, run, batch, dry_run)
+    global_callback(ctx, config, run, batch, dry_run, stage)
 
 
 # Import and register recipe groups

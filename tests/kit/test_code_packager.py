@@ -52,7 +52,7 @@ if __name__ == "__main__":
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
-    packager = CodePackager(script_path=str(script_rel), train_path=train_cfg)
+    packager = CodePackager(script_path=str(script_rel), train_path=str(train_cfg))
     tar_path = packager.package(repo_root, str(out_dir), "pkg")
 
     with tarfile.open(tar_path, "r:gz") as tf:

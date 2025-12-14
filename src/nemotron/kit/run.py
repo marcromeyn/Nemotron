@@ -67,6 +67,16 @@ class RunConfig:
         gpus_per_node: Slurm GPUs per node
         mem: Slurm memory request (e.g., '0' for all, '64G')
         exclusive: Request exclusive node access
+        cpus_per_task: Slurm CPUs per task
+        cpus_per_gpu: Slurm CPUs per GPU
+        gpus_per_task: Slurm GPUs per task
+        mem_per_gpu: Slurm memory per GPU (e.g., '32G')
+        mem_per_cpu: Slurm memory per CPU (e.g., '4G')
+        qos: Slurm quality of service
+        constraint: Slurm node constraints (e.g., 'a100')
+        exclude: Slurm nodes to exclude
+        gres: Slurm generic resources
+        array: Slurm job array specification
 
         tunnel: Tunnel type for Slurm (local or ssh)
         host: SSH host for remote job submission
@@ -124,6 +134,16 @@ class RunConfig:
     gpus_per_node: int | None = None
     mem: str | None = None
     exclusive: bool | None = None
+    cpus_per_task: int | None = None
+    cpus_per_gpu: int | None = None
+    gpus_per_task: int | None = None
+    mem_per_gpu: str | None = None
+    mem_per_cpu: str | None = None
+    qos: str | None = None
+    constraint: str | None = None
+    exclude: str | None = None
+    gres: str | None = None
+    array: str | None = None
 
     # SSH tunnel settings (for remote Slurm submission)
     tunnel: Literal["local", "ssh"] = "local"
@@ -339,18 +359,18 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
         except Exception:
             pass  # wandb not installed or not logged in
 
-    # Add PYTHONPATH for src-layout packages
-    # nemo-run sets workdir to /nemo_run/code, but src-layout needs /nemo_run/code/src
-    # Use ${PYTHONPATH:-} to avoid 'unbound variable' error when PYTHONPATH is not set
-    # (nemo-run's sbatch uses 'set -u')
-    if "PYTHONPATH" not in merged_env:
-        merged_env["PYTHONPATH"] = "/nemo_run/code/src:${PYTHONPATH:-}"
-    else:
-        merged_env["PYTHONPATH"] = f"/nemo_run/code/src:{merged_env['PYTHONPATH']}"
+    # Auto-detect Weights & Biases project/entity from env.toml [wandb] section
+    wandb_config = load_wandb_config()
+    if wandb_config is not None:
+        if wandb_config.project and "WANDB_PROJECT" not in merged_env:
+            merged_env["WANDB_PROJECT"] = wandb_config.project
+        if wandb_config.entity and "WANDB_ENTITY" not in merged_env:
+            merged_env["WANDB_ENTITY"] = wandb_config.entity
 
-    # Set NEMO_RUN_DIR to experiment root for output paths
-    # Container workdir is /nemo_run/code, but outputs should go to /nemo_run
-    merged_env.setdefault("NEMO_RUN_DIR", "/nemo_run")
+    # NOTE: PYTHONPATH and NEMO_RUN_DIR are NOT set here for Ray jobs.
+    # Ray jobs use nemo-run's SlurmRayJob which rsyncs to {cluster_dir}/code
+    # but does NOT mount to /nemo_run. The workdir is set to the actual path.
+    # We handle this in run_with_nemo_run() by using relative paths.
 
     match config.executor:
         case "local":
@@ -391,6 +411,16 @@ def build_executor(config: RunConfig, env_vars: dict[str, str] | None = None) ->
                 time=config.time,
                 mem=config.mem,
                 exclusive=config.exclusive,
+                cpus_per_task=config.cpus_per_task,
+                cpus_per_gpu=config.cpus_per_gpu,
+                gpus_per_task=config.gpus_per_task,
+                mem_per_gpu=config.mem_per_gpu,
+                mem_per_cpu=config.mem_per_cpu,
+                qos=config.qos,
+                constraint=config.constraint,
+                exclude=config.exclude,
+                gres=config.gres,
+                array=config.array,
                 container_image=config.container_image,
                 container_mounts=config.mounts,
                 tunnel=tunnel,
@@ -756,26 +786,13 @@ def run_with_nemo_run(
             log_file = f"{run_config.remote_job_dir}/{job_name}/logs/ray-job.log"
             log_clear_cmd = f": > {log_file} 2>/dev/null || true"
 
-        # Check if this is a direct script path (container path, no nemotron install needed)
-        is_direct_script = script_path.startswith("/nemo_run/code/")
-
-        if is_direct_script:
-            # Direct script execution - no uv sync needed
-            # Script only depends on packages already in the container (e.g., nemo-rl)
-            setup_commands = [
-                "find . -type d -name __pycache__ -delete 2>/dev/null || true",
-            ]
-        else:
-            # Module execution - sync nemotron package
-            # This ensures Ray and the nemotron package are available to all workers
-            # Use --reinstall-package to force update the local editable package
-            # and clear __pycache__ to avoid stale bytecode
-            # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
-            # Note: uv is already available in the container image
-            setup_commands = [
-                "find . -type d -name __pycache__ -delete 2>/dev/null || true",
-                "uv sync --reinstall-package nemotron",
-            ]
+        # Setup commands to prepare the environment before running
+        # Use uv sync to ensure nemotron package is available (for Ray workers too)
+        # Clear __pycache__ to avoid stale bytecode issues
+        setup_commands = [
+            "find . -type d -name __pycache__ -delete 2>/dev/null || true",
+            "uv sync --reinstall-package nemotron",
+        ]
 
         # Prepend log clearing if remote_job_dir is configured
         if log_clear_cmd:
@@ -788,23 +805,11 @@ def run_with_nemo_run(
                 if cmd not in pre_ray_start_commands:
                     pre_ray_start_commands = [cmd] + pre_ray_start_commands
 
-        if is_direct_script:
-            # Direct script execution - run python directly
-            cmd = f"python {script_path}"
-            if script_args:
-                cmd += " " + " ".join(script_args)
-        else:
-            # Use uv run to execute script with proper project environment
-            # Prepend cache cleanup and reinstall to ensure fresh code on each job
-            # This handles the case where Ray cluster is reused across code changes
-            # Note: Using -delete instead of -exec to avoid shell escaping issues with {}
-            cmd = (
-                "find . -type d -name __pycache__ -delete 2>/dev/null || true && "
-                "uv sync --reinstall-package nemotron && "
-                f"uv run {script_path}"
-            )
-            if script_args:
-                cmd += " " + " ".join(script_args)
+        # Use uv run to execute script with proper project environment
+        # This ensures Ray workers also use the same environment
+        cmd = f"uv run python {script_path}"
+        if script_args:
+            cmd += " " + " ".join(script_args)
 
         # Build runtime_env with environment variables for Ray workers
         # This ensures env vars like HF_TOKEN are available in Ray tasks/actors
@@ -830,6 +835,14 @@ def run_with_nemo_run(
         except Exception:
             pass
 
+        # Load wandb project/entity from env.toml [wandb] section
+        wandb_config = load_wandb_config()
+        if wandb_config is not None:
+            if wandb_config.project:
+                runtime_env["env_vars"]["WANDB_PROJECT"] = wandb_config.project
+            if wandb_config.entity:
+                runtime_env["env_vars"]["WANDB_ENTITY"] = wandb_config.entity
+
         # Create temporary runtime_env YAML file if we have env vars to pass
         runtime_env_yaml = None
         if runtime_env["env_vars"]:
@@ -844,6 +857,16 @@ def run_with_nemo_run(
             # For Ray jobs, prefer nemo-run's native workdir rsync (respects .gitignore)
             # instead of the packager->tar->extract->rsync path.
             ray_workdir = "."
+
+        # Display job submission summary
+        from nemotron.kit.cli.display import display_ray_job_submission
+
+        display_ray_job_submission(
+            script_path=script_path,
+            script_args=script_args or [],
+            env_vars=runtime_env.get("env_vars", {}),
+            mode="detached" if run_config.detach else "attached",
+        )
 
         ray_job.start(
             command=cmd,
@@ -865,7 +888,8 @@ def run_with_nemo_run(
 
         if not run_config.detach:
             try:
-                ray_job.logs(follow=True)
+                # Wait up to 10 minutes for log file to appear (Slurm jobs can be slow to start)
+                ray_job.logs(follow=True, timeout=600)
             except KeyboardInterrupt:
                 if run_config.ray_mode == "cluster":
                     # In cluster mode, keep the cluster running for subsequent jobs

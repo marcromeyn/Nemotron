@@ -21,7 +21,7 @@ class CodePackager(Packager):
     """
 
     script_path: str
-    train_path: Path
+    train_path: str
     exclude_dirs: tuple[str, ...] = ("usage-cookbook", "use-case-examples")
 
     def package(self, path: Path, job_dir: str, name: str) -> str:
@@ -35,7 +35,7 @@ class CodePackager(Packager):
 
         with tarfile.open(output_file, "w:gz") as tf:
             tf.addfile(self._tarinfo_for_text("main.py", launcher), self._bytes_io(launcher))
-            tf.add(self.train_path, arcname="config.yaml")
+            tf.add(Path(self.train_path), arcname="config.yaml")
 
             for rel in self._iter_repo_paths(repo_root):
                 if self._is_excluded(rel):

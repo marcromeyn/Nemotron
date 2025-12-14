@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Data preparation for Nano3 pretraining stage.
 
 Tokenizes raw text data into Megatron bin/idx format.
@@ -6,18 +7,41 @@ Outputs blend.json with {"train": [...], "valid": [...], "test": [...]} format
 compatible with Megatron-Bridge's per_split_data_args_path parameter.
 
 Usage:
-    python -m nemotron.recipes.nano3.stage0_pretrain.data_prep [options]
+    # With default config
+    python data_prep.py
+
+    # With custom config file
+    python data_prep.py --config /path/to/config.yaml
+
+    # With CLI overrides (Hydra-style)
+    python data_prep.py sample=100 force=true
+
+    # Via nemotron CLI with nemo-run
+    nemotron nano3 data prep pretrain --run prep --sample 10000
 """
 
+from __future__ import annotations
+
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from nemotron.data_prep import DataPrepConfig, PerSplitConfig, run_data_prep
-from nemotron.kit import DataBlendsArtifact, cli, print_step_complete
+from nemotron.kit import DataBlendsArtifact, print_step_complete
+from nemotron.kit.train_script import (
+    apply_hydra_overrides,
+    init_wandb_from_env,
+    load_omegaconf_yaml,
+    omegaconf_to_dataclass,
+    parse_config_and_overrides,
+)
 from nemotron.kit.wandb import add_wandb_tags
 
 STAGE_PATH = Path(__file__).parent
+
+# Default config path relative to this file
+DEFAULT_CONFIG_PATH = STAGE_PATH / "config" / "data_prep.yaml"
 
 # Use NEMO_RUN_DIR for output when running via nemo-run (avoids writing to code dir)
 _OUTPUT_BASE = Path(os.environ.get("NEMO_RUN_DIR", "."))
@@ -77,12 +101,26 @@ class PreTrainDataPrepConfig:
     """Force new run, ignoring cache"""
 
     def __post_init__(self) -> None:
+        # Ensure paths are Path objects
+        if isinstance(self.blend_path, str):
+            self.blend_path = Path(self.blend_path)
+        if isinstance(self.output_dir, str):
+            self.output_dir = Path(self.output_dir)
+
+        # Add sample suffix to output_dir if sampling
         if self.sample is not None:
             self.output_dir = self.output_dir / f"sample-{self.sample}"
 
 
-def main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
-    """Run pretrain data preparation."""
+def run_data_prep_main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
+    """Run pretrain data preparation.
+
+    Args:
+        cfg: Data prep configuration.
+
+    Returns:
+        DataBlendsArtifact with paths to tokenized data.
+    """
     # Add stage-specific tags to wandb run
     add_wandb_tags(["data-prep", "pretrain"])
 
@@ -114,5 +152,39 @@ def main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
     return artifact
 
 
+def main(cfg: PreTrainDataPrepConfig | None = None) -> DataBlendsArtifact:
+    """Entry point for pretrain data preparation.
+
+    Args:
+        cfg: Config from CLI framework, or None when run directly as script.
+
+    Returns:
+        DataBlendsArtifact with paths to tokenized data.
+    """
+    if cfg is None:
+        # Called directly as script - parse config ourselves
+        config_path, cli_overrides = parse_config_and_overrides(default_config=DEFAULT_CONFIG_PATH)
+
+        # Load YAML config
+        try:
+            config = load_omegaconf_yaml(config_path)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Apply CLI overrides (Hydra-style: key=value)
+        if cli_overrides:
+            config = apply_hydra_overrides(config, cli_overrides)
+
+        # Convert to dataclass
+        cfg = omegaconf_to_dataclass(config, PreTrainDataPrepConfig)
+
+    # Initialize wandb from environment variables (set by nemo-run)
+    init_wandb_from_env()
+
+    # Run data prep
+    return run_data_prep_main(cfg)
+
+
 if __name__ == "__main__":
-    cli(main, ray=True)
+    main()

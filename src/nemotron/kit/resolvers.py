@@ -31,7 +31,10 @@ Usage in training script:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -64,6 +67,58 @@ def _normalize_version(version: str | None) -> str:
     if version.isdigit():
         return f"v{version}"
     return version
+
+
+def _get_distributed_info() -> tuple[int, int]:
+    """Get rank and world_size from torchrun environment variables.
+
+    Returns:
+        Tuple of (rank, world_size). Defaults to (0, 1) for single-process runs.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world_size
+
+
+def _get_marker_path(artifacts: dict[str, str]) -> Path:
+    """Generate a unique marker file path based on artifact references.
+
+    Args:
+        artifacts: Dict of artifact key -> artifact reference.
+
+    Returns:
+        Path to marker file in temp directory.
+    """
+    # Hash the artifacts dict to create a unique marker per config
+    artifacts_str = json.dumps(sorted(artifacts.items()))
+    hash_suffix = hashlib.md5(artifacts_str.encode()).hexdigest()[:8]
+    return Path(os.environ.get("TMPDIR", "/tmp")) / f".nemotron_artifacts_{hash_suffix}"
+
+
+def _wait_for_artifacts(marker_path: Path, timeout: int = 600) -> dict[str, Any]:
+    """Wait for rank 0 to complete artifact downloads and read results.
+
+    Args:
+        marker_path: Path to marker file written by rank 0.
+        timeout: Maximum seconds to wait (default: 600 = 10 minutes).
+
+    Returns:
+        Dict with "results" and "qualified_names" from rank 0.
+
+    Raises:
+        TimeoutError: If rank 0 doesn't complete within timeout.
+    """
+    start = time.time()
+    while not marker_path.exists():
+        if time.time() - start > timeout:
+            raise TimeoutError(
+                f"Timeout waiting for rank 0 to download artifacts (marker: {marker_path})"
+            )
+        time.sleep(1.0)
+
+    # Read the artifact data written by rank 0
+    data = json.loads(marker_path.read_text())
+    return data
 
 
 def _resolve_artifact_active_run(name: str, version: str | None = None) -> dict[str, Any]:
@@ -225,23 +280,64 @@ def register_resolvers(
 
     # Pre-resolve all artifacts
     if artifacts:
-        for key, artifact_ref in artifacts.items():
-            if mode == "active_run":
-                name, version = _parse_artifact_ref(artifact_ref)
-                result = _resolve_artifact_active_run(name, version)
-            elif mode == "pre_init":
-                result = resolve_artifact_pre_init(
-                    artifact_ref,
-                    patch_http_digest=pre_init_patch_http_digest,
-                )
+        rank, world_size = _get_distributed_info()
+
+        if world_size > 1:
+            # Distributed mode: only rank 0 downloads, others wait
+            marker_path = _get_marker_path(artifacts)
+
+            if rank == 0:
+                # Rank 0: download artifacts and write marker file
+                results: dict[str, dict[str, Any]] = {}
+                for key, artifact_ref in artifacts.items():
+                    if mode == "active_run":
+                        name, version = _parse_artifact_ref(artifact_ref)
+                        result = _resolve_artifact_active_run(name, version)
+                    elif mode == "pre_init":
+                        result = resolve_artifact_pre_init(
+                            artifact_ref,
+                            patch_http_digest=pre_init_patch_http_digest,
+                        )
+                    else:
+                        raise ValueError(f"Unknown resolver mode: {mode}")
+
+                    _ARTIFACT_REGISTRY[key] = result
+                    results[key] = result
+
+                    qname = result.get("qualified_name")
+                    if qname:
+                        qualified_names.append(str(qname))
+
+                # Signal completion to other ranks
+                marker_path.write_text(json.dumps({
+                    "results": results,
+                    "qualified_names": qualified_names,
+                }))
             else:
-                raise ValueError(f"Unknown resolver mode: {mode}")
+                # Other ranks: wait for rank 0 and use shared results
+                data = _wait_for_artifacts(marker_path)
+                for key, result in data["results"].items():
+                    _ARTIFACT_REGISTRY[key] = result
+                qualified_names = data["qualified_names"]
+        else:
+            # Single process mode: download directly (existing behavior)
+            for key, artifact_ref in artifacts.items():
+                if mode == "active_run":
+                    name, version = _parse_artifact_ref(artifact_ref)
+                    result = _resolve_artifact_active_run(name, version)
+                elif mode == "pre_init":
+                    result = resolve_artifact_pre_init(
+                        artifact_ref,
+                        patch_http_digest=pre_init_patch_http_digest,
+                    )
+                else:
+                    raise ValueError(f"Unknown resolver mode: {mode}")
 
-            _ARTIFACT_REGISTRY[key] = result
+                _ARTIFACT_REGISTRY[key] = result
 
-            qname = result.get("qualified_name")
-            if qname:
-                qualified_names.append(str(qname))
+                qname = result.get("qualified_name")
+                if qname:
+                    qualified_names.append(str(qname))
 
     # Register the resolver
     # ${art.data.path} -> _art_resolver("data", "path")

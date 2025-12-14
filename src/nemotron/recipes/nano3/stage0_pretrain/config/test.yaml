@@ -15,8 +15,8 @@ train:
   train_iters: 1000
   global_batch_size: 32
 
-# model:
-#   pipeline_model_parallel_size: 2
+model:
+  pipeline_model_parallel_size: 2
 
 tokenizer:
   tokenizer_type: HuggingFaceTokenizer
