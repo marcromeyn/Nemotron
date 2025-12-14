@@ -83,16 +83,23 @@ def _get_distributed_info() -> tuple[int, int]:
 def _get_marker_path(artifacts: dict[str, str]) -> Path:
     """Generate a unique marker file path based on artifact references.
 
+    Uses NEMO_RUN_DIR (shared filesystem) if available for multi-node jobs,
+    otherwise falls back to TMPDIR or /tmp.
+
     Args:
         artifacts: Dict of artifact key -> artifact reference.
 
     Returns:
-        Path to marker file in temp directory.
+        Path to marker file on shared or local storage.
     """
     # Hash the artifacts dict to create a unique marker per config
     artifacts_str = json.dumps(sorted(artifacts.items()))
     hash_suffix = hashlib.md5(artifacts_str.encode()).hexdigest()[:8]
-    return Path(os.environ.get("TMPDIR", "/tmp")) / f".nemotron_artifacts_{hash_suffix}"
+
+    # Prefer NEMO_RUN_DIR (shared filesystem) for multi-node jobs
+    # Fall back to TMPDIR or /tmp for single-node or local runs
+    base_dir = os.environ.get("NEMO_RUN_DIR") or os.environ.get("TMPDIR", "/tmp")
+    return Path(base_dir) / f".nemotron_artifacts_{hash_suffix}"
 
 
 def _wait_for_artifacts(marker_path: Path, timeout: int = 600) -> dict[str, Any]:
