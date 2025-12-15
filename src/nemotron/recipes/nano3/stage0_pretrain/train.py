@@ -37,11 +37,14 @@ from nemotron.kit.recipe_loader import extract_recipe_config, import_recipe_func
 from nemotron.kit.resolvers import register_resolvers_from_config
 from nemotron.kit.train_script import load_omegaconf_yaml, parse_config_and_overrides
 from nemotron.kit.wandb import (
+    patch_wandb_checkpoint_logging,
     patch_wandb_http_handler_skip_digest_verification,
     patch_wandb_init_for_lineage,
+    patch_wandb_runid_for_seeded_random,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
 
 # Default config path relative to this file
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
@@ -63,6 +66,13 @@ def main() -> None:
         sys.exit(1)
 
     patch_wandb_http_handler_skip_digest_verification()
+
+    # Fix "Invalid Client ID digest" error caused by seeded random (wandb bug)
+    # See: https://github.com/wandb/wandb/pull/11039
+    patch_wandb_runid_for_seeded_random()
+
+    # Apply monkey patch for wandb checkpoint artifact logging
+    patch_wandb_checkpoint_logging()
 
     # Resolve artifacts before wandb.init() (Megatron-Bridge initializes wandb).
     qualified_names = register_resolvers_from_config(
@@ -113,6 +123,16 @@ def main() -> None:
     apply_overrides(cfg, final_overrides_as_dict, excluded_fields)
 
     pretrain(config=cfg, forward_step_func=forward_step)
+
+    # # Finish wandb run to ensure all artifacts are synced
+    # try:
+    #     import wandb
+    #     if wandb.run is not None:
+    #         logger.info("[WANDB] Finishing wandb run...")
+    #         wandb.finish()
+    #         logger.info("[WANDB] Wandb run finished")
+    # except Exception as e:
+    #     logger.warning(f"[WANDB] Failed to finish wandb run: {e}")
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

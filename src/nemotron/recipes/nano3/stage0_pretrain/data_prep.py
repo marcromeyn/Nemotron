@@ -58,7 +58,7 @@ class PreTrainDataPrepConfig:
     Outputs {"train": [...], "valid": [...], "test": [...]} JSON format.
     """
 
-    blend_path: Path = field(default_factory=lambda: STAGE_PATH / "data_blend_raw.json")
+    blend_path: Path = field(default_factory=lambda: STAGE_PATH / "config/data_blend_raw.json")
     """Path to data blend JSON file"""
 
     output_dir: Path = field(default_factory=lambda: _OUTPUT_BASE / "output/nano3/stage0_pretrain")

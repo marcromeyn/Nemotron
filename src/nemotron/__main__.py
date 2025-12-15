@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Nemotron CLI entry point.
 
-Usage (new typer-based CLI):
+Usage:
     nemotron nano3 pretrain -c test                       # local execution
     nemotron nano3 pretrain --config test --run dlw       # nemo-run attached
     nemotron nano3 pretrain -c test -r dlw train.train_iters=5000
@@ -15,27 +15,7 @@ from __future__ import annotations
 
 
 def main() -> None:
-    """Main CLI entry point.
-
-    During the CLI refactor (typer + omegaconf), we keep a small compatibility
-    layer:
-    - Launch the stage TUI for bare `nemotron nano3 {pretrain,sft,rl}`.
-    - Fall back to the legacy tyro-based nano3 app for commands not yet
-      implemented in the typer CLI (e.g. `nano3 data ...`).
-    """
-
-    import sys
-
-    args = sys.argv[1:]
-    if len(args) >= 2 and args[0] == "nano3":
-        # Fallback to legacy nano3 app for not-yet-migrated subcommands.
-        if args[1] not in {"pretrain"}:
-            from nemotron.recipes.nano3 import app as legacy_app
-
-            sys.argv = [sys.argv[0]] + args[1:]
-            legacy_app.run()
-            return
-
+    """Main CLI entry point."""
     from nemotron.cli.bin.nemotron import main as typer_main
 
     typer_main()

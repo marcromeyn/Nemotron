@@ -211,17 +211,38 @@ def discover_hf_files(config: DatasetConfig) -> list[FileInfo]:
     for sibling in dataset_info.siblings:
         filename = sibling.rfilename
 
-        # Match pattern: data/{split}-XXXXX-of-YYYYY.parquet or similar
-        # Require split to be a path component (not just substring)
-        # Valid: "train-00000", "data/train-00000", "en/train/file.parquet"
-        # Invalid: "training-data", "retrain-00000"
-        if not filename.endswith(".parquet"):
+        # Match data files: parquet or jsonl
+        # Valid extensions: .parquet, .jsonl, .json
+        is_data_file = (
+            filename.endswith(".parquet")
+            or filename.endswith(".jsonl")
+            or filename.endswith(".json")
+        )
+        if not is_data_file:
             continue
 
         # Check if subset is specified and matches
+        # HuggingFace datasets use various patterns:
+        # - data/{subset}-{split}-00000.parquet (subset as filename prefix)
+        # - {subset}/{split}-00000.parquet (subset as directory)
+        # - data/{subset}/{split}-00000.parquet (subset as subdirectory)
+        # - data/{subset}.jsonl (subset as filename without split)
         if config.subset:
-            if f"/{config.subset}/" not in filename and not filename.startswith(
-                f"{config.subset}/"
+            subset = config.subset
+            # Get the base filename without extension for matching
+            base_filename = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            # Check various patterns where subset can appear
+            if not (
+                f"/{subset}/" in filename  # subset as directory
+                or filename.startswith(f"{subset}/")  # subset at start as directory
+                or f"/{subset}-" in filename  # subset as filename prefix after path
+                or f"/{subset}_" in filename  # subset with underscore separator
+                or filename.startswith(f"{subset}-")  # subset at start of filename
+                or filename.startswith(f"{subset}_")  # subset with underscore at start
+                or f"data/{subset}-" in filename  # common HF pattern: data/{subset}-
+                or f"data/{subset}_" in filename  # common HF pattern with underscore
+                or base_filename == subset  # exact match: data/{subset}.jsonl
+                or f"/{subset}." in filename  # subset before extension: data/{subset}.jsonl
             ):
                 continue
 

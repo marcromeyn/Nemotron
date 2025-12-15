@@ -15,7 +15,7 @@ prep_app = typer.Typer(
     no_args_is_help=True,
 )
 
-# Register commands
+# Register commands with allow_extra_args for dotlist overrides
 prep_app.command(
     name="pretrain",
     context_settings={

@@ -500,6 +500,10 @@ class App:
         # after subcommand parsing. For now, just filter out the arg.
         filtered_args = _filter_config_file_args(remaining_args)
 
+        # Convert Hydra-style key=value arguments to tyro-style --key value
+        # This allows users to use either: sample=1000 or --sample 1000
+        filtered_args = _convert_hydra_to_tyro_args(filtered_args)
+
         # Build tyro Union type, handler mapping, artifacts mapping, defaults_fn mapping, and kwargs_schema mapping with global options
         union_type, handlers, artifacts_map, defaults_fn_map, kwargs_schema_map = self.build(include_global_options=True)
 
@@ -1588,3 +1592,50 @@ def _filter_config_file_args(args: list[str]) -> list[str]:
             i += 1
 
     return filtered
+
+
+def _convert_hydra_to_tyro_args(args: list[str]) -> list[str]:
+    """Convert Hydra-style key=value arguments to tyro-style --key value.
+
+    This allows users to use either syntax:
+    - Hydra-style: sample=1000 force=true
+    - Tyro-style: --sample 1000 --force
+
+    Args:
+        args: Command line arguments
+
+    Returns:
+        Arguments with key=value converted to --key value format.
+
+    Examples:
+        >>> _convert_hydra_to_tyro_args(["data", "prep", "sft", "sample=1000", "--force"])
+        ["data", "prep", "sft", "--sample", "1000", "--force"]
+        >>> _convert_hydra_to_tyro_args(["pretrain", "train.batch_size=32"])
+        ["pretrain", "--train.batch-size", "32"]
+    """
+    result: list[str] = []
+
+    for arg in args:
+        # Skip if it's already a flag (starts with -)
+        if arg.startswith("-"):
+            result.append(arg)
+            continue
+
+        # Check for key=value pattern (no leading dash, contains =)
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+            # Convert underscores to hyphens for CLI compatibility
+            key = key.replace("_", "-")
+            # Handle boolean values: force=true -> --force, force=false -> --no-force
+            if value.lower() in ("true", "1", "yes"):
+                result.append(f"--{key}")
+            elif value.lower() in ("false", "0", "no"):
+                result.append(f"--no-{key}")
+            else:
+                result.append(f"--{key}")
+                result.append(value)
+        else:
+            # Not a key=value, pass through as-is (likely a subcommand)
+            result.append(arg)
+
+    return result

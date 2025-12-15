@@ -89,6 +89,17 @@ def setup_single_nemo_gym_dataset(
 
 def main() -> None:
     """Main entry point for GRPO training."""
+    # Apply wandb monkey patches early, before any wandb imports/init
+    from nemotron.kit.wandb import (
+        patch_nemo_rl_checkpoint_logging,
+        patch_wandb_http_handler_skip_digest_verification,
+        patch_wandb_runid_for_seeded_random,
+    )
+
+    patch_wandb_http_handler_skip_digest_verification()
+    patch_wandb_runid_for_seeded_random()
+    patch_nemo_rl_checkpoint_logging()
+
     # Increase W&B single object size warning threshold
     import wandb.util
     wandb.util.VALUE_BYTES_LIMIT = 10_000_000

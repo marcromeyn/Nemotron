@@ -228,15 +228,36 @@ def resolve_artifact_pre_init(
     return result
 
 
+def _read_artifact_metadata(artifact_path: str) -> dict[str, Any]:
+    """Read metadata.json from an artifact directory.
+
+    Args:
+        artifact_path: Path to the artifact directory.
+
+    Returns:
+        Parsed metadata dict, or empty dict if not found.
+    """
+    metadata_path = Path(artifact_path) / "metadata.json"
+    if metadata_path.exists():
+        return json.loads(metadata_path.read_text())
+    return {}
+
+
 def _art_resolver(name: str, field: str = "path") -> str:
-    """OmegaConf resolver for ${art.NAME.FIELD} syntax.
+    """OmegaConf resolver for ${art:NAME,FIELD} syntax.
 
     Args:
         name: Artifact key from run.artifacts (e.g., "data", "model")
-        field: Field to return (default: "path"). Options: path, version, name, type
+        field: Field to return (default: "path"). Options:
+            - path, version, name, type: Basic artifact fields
+            - metadata.X: Read field X from artifact's metadata.json
 
     Returns:
         The requested field value as string
+
+    Examples:
+        ${art:data,path}              -> /path/to/artifact
+        ${art:data,metadata.pack_size} -> 4096
     """
     if name not in _ARTIFACT_REGISTRY:
         raise KeyError(
@@ -247,10 +268,25 @@ def _art_resolver(name: str, field: str = "path") -> str:
 
     artifact_info = _ARTIFACT_REGISTRY[name]
 
+    # Handle metadata.* fields by reading from metadata.json
+    if field.startswith("metadata."):
+        metadata_field = field[len("metadata."):]
+        artifact_path = artifact_info.get("path")
+        if not artifact_path:
+            raise KeyError(f"Artifact '{name}' has no path, cannot read metadata")
+
+        metadata = _read_artifact_metadata(artifact_path)
+        if metadata_field not in metadata:
+            raise KeyError(
+                f"Field '{metadata_field}' not found in metadata.json for artifact '{name}'. "
+                f"Available fields: {list(metadata.keys())}"
+            )
+        return str(metadata[metadata_field])
+
     if field not in artifact_info:
         raise KeyError(
             f"Unknown field '{field}' for artifact '{name}'. "
-            f"Available fields: {list(artifact_info.keys())}"
+            f"Available fields: {list(artifact_info.keys())} or metadata.*"
         )
 
     return str(artifact_info[field])
@@ -316,6 +352,7 @@ def register_resolvers(
                         qualified_names.append(str(qname))
 
                 # Signal completion to other ranks
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
                 marker_path.write_text(json.dumps({
                     "results": results,
                     "qualified_names": qualified_names,

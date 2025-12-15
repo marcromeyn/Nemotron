@@ -177,6 +177,9 @@ def finish_wandb(exit_code: int = 0) -> None:
 _HTTP_HANDLER_PATCHED = False
 _WANDB_INIT_PATCHED = False
 _LINEAGE_REGISTERED = False
+_RUNID_PATCHED = False
+_CHECKPOINT_LOGGING_PATCHED = False
+_NEMO_RL_CHECKPOINT_LOGGING_PATCHED = False
 _PENDING_ARTIFACT_QUALIFIED_NAMES: set[str] = set()
 _PENDING_TAGS: set[str] = set()
 
@@ -285,3 +288,166 @@ def _register_lineage_if_possible() -> None:
             logger.warning(f"Failed to register artifact lineage for {qname}: {e}")
 
     _LINEAGE_REGISTERED = True
+
+
+def patch_wandb_runid_for_seeded_random() -> None:
+    """Patch wandb's generate_fast_id to use an independent random instance.
+
+    This fixes the "Invalid Client ID digest" error that occurs when random.seed()
+    is called before artifact creation (common in ML training for reproducibility).
+    See: https://github.com/wandb/wandb/pull/11039
+    """
+    global _RUNID_PATCHED
+    if _RUNID_PATCHED:
+        return
+
+    import os
+    import random as random_module
+
+    from wandb.sdk.artifacts import artifact as artifact_module
+    from wandb.sdk.lib import runid
+
+    # Create an independent random instance seeded from OS entropy
+    # This ensures it's not affected by any global random.seed() calls
+    _independent_random = random_module.Random()
+    _independent_random.seed(os.urandom(32))  # Seed from OS entropy
+
+    _ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+    def patched_generate_fast_id(length: int = 8) -> str:
+        return "".join(_independent_random.choices(_ID_CHARS, k=length))
+
+    # Patch both the source module AND the artifact module's imported reference
+    runid.generate_fast_id = patched_generate_fast_id
+    artifact_module.generate_fast_id = patched_generate_fast_id
+    _RUNID_PATCHED = True
+    logger.info("[WANDB] Patched generate_fast_id in both runid and artifact modules")
+
+
+def patch_wandb_checkpoint_logging() -> None:
+    """Monkey patch on_save_checkpoint_success to use add_reference like Megatron-Bridge.
+
+    The original Megatron-Bridge code uses add_reference(checksum=False) but doesn't
+    call wait(), so artifacts don't show up in real-time. This patch adds wait() to
+    ensure artifacts are committed immediately.
+    """
+    from pathlib import Path
+    from typing import Any, Optional
+
+    global _CHECKPOINT_LOGGING_PATCHED
+    if _CHECKPOINT_LOGGING_PATCHED:
+        return
+
+    from megatron.bridge.training.utils import wandb_utils
+
+    def patched_on_save_checkpoint_success(
+        checkpoint_path: str,
+        save_dir: str,
+        iteration: int,
+        wandb_writer: Optional[Any],
+    ) -> None:
+        if not wandb_writer or not wandb_writer.run:
+            return
+
+        try:
+            checkpoint_path_resolved = str(Path(checkpoint_path).resolve())
+            artifact_name, artifact_version = wandb_utils._get_artifact_name_and_version(
+                Path(save_dir), Path(checkpoint_path)
+            )
+
+            # Create artifact with file reference (like Megatron-Bridge)
+            metadata = {"iteration": iteration}
+            artifact = wandb_writer.Artifact(artifact_name, type="model", metadata=metadata)
+            artifact.add_reference(f"file://{checkpoint_path_resolved}", checksum=False)
+
+            # Log artifact with alias
+            logged = wandb_writer.run.log_artifact(artifact, aliases=[artifact_version])
+
+            # Wait for commit (this is what was missing in Megatron-Bridge)
+            logged.wait()
+            logger.info(f"[WANDB] Artifact committed: {artifact_name}:{artifact_version}")
+
+            # Write tracker file for later reference
+            wandb_tracker_filename = wandb_utils._get_wandb_artifact_tracker_filename(save_dir)
+            wandb_tracker_filename.write_text(f"{wandb_writer.run.entity}/{wandb_writer.run.project}")
+        except Exception as e:
+            logger.error(f"[WANDB] Failed to log checkpoint artifact: {e}")
+
+    wandb_utils.on_save_checkpoint_success = patched_on_save_checkpoint_success
+    _CHECKPOINT_LOGGING_PATCHED = True
+    logger.info("[WANDB] Patched checkpoint logging to add wait() call")
+
+
+def patch_nemo_rl_checkpoint_logging() -> None:
+    """Monkey patch NeMo-RL's CheckpointManager to log checkpoint artifacts to W&B.
+
+    NeMo-RL uses a different checkpoint mechanism than Megatron-Bridge. This patch
+    wraps CheckpointManager.finalize_checkpoint() to log the checkpoint as a W&B
+    artifact after the checkpoint is finalized.
+
+    The artifact is created with:
+    - type: "model"
+    - name: "rl" (to match pretrain/sft naming convention)
+    - metadata: step number extracted from checkpoint path
+    - file reference: local path to checkpoint directory
+    """
+    from pathlib import Path
+    from typing import Any
+
+    global _NEMO_RL_CHECKPOINT_LOGGING_PATCHED
+    if _NEMO_RL_CHECKPOINT_LOGGING_PATCHED:
+        return
+
+    try:
+        from nemo_rl.utils.checkpoint import CheckpointManager
+    except ImportError:
+        logger.warning("[WANDB] nemo_rl not installed, skipping checkpoint logging patch")
+        return
+
+    original_finalize_checkpoint = CheckpointManager.finalize_checkpoint
+
+    def patched_finalize_checkpoint(self, checkpoint_path: Any) -> None:
+        """Finalize checkpoint and log to W&B as artifact."""
+        # Call original finalize first
+        original_finalize_checkpoint(self, checkpoint_path)
+
+        # Now log to wandb
+        try:
+            import wandb
+        except ImportError:
+            return
+
+        if wandb.run is None:
+            return
+
+        try:
+            checkpoint_path = Path(checkpoint_path)
+            # After finalize, tmp_step_X becomes step_X
+            step_str = checkpoint_path.name.split("_")[-1]
+            step = int(step_str)
+
+            # Final checkpoint path after rename
+            final_checkpoint_path = checkpoint_path.parent / f"step_{step}"
+            checkpoint_path_resolved = str(final_checkpoint_path.resolve())
+
+            # Create artifact with naming convention matching pretrain/sft
+            artifact_name = "rl"
+            artifact_version = f"step_{step}"
+
+            metadata = {"step": step}
+            artifact = wandb.Artifact(artifact_name, type="model", metadata=metadata)
+            artifact.add_reference(f"file://{checkpoint_path_resolved}", checksum=False)
+
+            # Log artifact with alias
+            logged = wandb.run.log_artifact(artifact, aliases=[artifact_version, "latest"])
+
+            # Wait for commit to ensure artifact is visible immediately
+            logged.wait()
+            logger.info(f"[WANDB] RL checkpoint artifact committed: {artifact_name}:{artifact_version}")
+
+        except Exception as e:
+            logger.error(f"[WANDB] Failed to log RL checkpoint artifact: {e}")
+
+    CheckpointManager.finalize_checkpoint = patched_finalize_checkpoint
+    _NEMO_RL_CHECKPOINT_LOGGING_PATCHED = True
+    logger.info("[WANDB] Patched NeMo-RL CheckpointManager for artifact logging")

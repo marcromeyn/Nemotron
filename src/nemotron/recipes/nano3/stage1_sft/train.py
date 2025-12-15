@@ -2,80 +2,130 @@
 """SFT (Supervised Fine-Tuning) script for Nemotron Nano3.
 
 Uses Megatron-Bridge's ConfigContainer for full training configuration.
-Uses the nemotron_nano_9b_v2_finetune_config recipe.
+Dynamically loads the recipe function specified in the YAML config.
 
 Usage:
-    # Direct execution inside container (nemo-run, no nemotron package required)
-    python /path/to/train.py
-
-    # With YAML config file
-    python /path/to/train.py --config-file /path/to/sft.yaml
+    # With YAML config file (required)
+    python /path/to/train.py --config /path/to/sft.yaml
 
     # With CLI overrides (Hydra syntax)
-    python /path/to/train.py train.train_iters=5000 optimizer.lr=0.0001
+    python /path/to/train.py --config /path/to/sft.yaml train.train_iters=5000
 
     # As module (requires nemotron package installed)
-    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage1_sft.train
+    torchrun --nproc_per_node=8 -m nemotron.recipes.nano3.stage1_sft.train \
+        --config /path/to/sft.yaml
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import logging
+import sys
+from pathlib import Path
 
-if TYPE_CHECKING:
-    from megatron.bridge.training.config import ConfigContainer
+import torch
+from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.finetune import finetune
+from megatron.bridge.training.gpt_step import forward_step
+from megatron.bridge.training.utils.omegaconf_utils import (
+    apply_overrides,
+    create_omegaconf_dict_config,
+    parse_hydra_overrides,
+)
+from omegaconf import OmegaConf
+
+from nemotron.kit.recipe_loader import extract_recipe_config, import_recipe_function
+from nemotron.kit.resolvers import register_resolvers_from_config
+from nemotron.kit.train_script import load_omegaconf_yaml, parse_config_and_overrides
+from nemotron.kit.wandb import (
+    patch_wandb_checkpoint_logging,
+    patch_wandb_http_handler_skip_digest_verification,
+    patch_wandb_init_for_lineage,
+    patch_wandb_runid_for_seeded_random,
+)
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
-def main(config: ConfigContainer):
-    """Run Nano3 supervised fine-tuning.
+# Default config path relative to this file
+DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
 
-    Args:
-        config: ConfigContainer with full training configuration.
-    """
-    from megatron.bridge.training.finetune import finetune
-    from megatron.bridge.training.gpt_step import forward_step
-
-    finetune(config=config, forward_step_func=forward_step)
+# Default recipe function
+DEFAULT_RECIPE_TARGET = (
+    "megatron.bridge.recipes.nemotronh.nemotron_nano_9b_v2_finetune_config"
+)
 
 
-if __name__ == "__main__":
-    import argparse
-    import logging
-    import sys
-
-    from megatron.bridge.recipes.nemotronh import nemotron_nano_9b_v2_finetune_config
-    from megatron.bridge.training.utils.omegaconf_utils import process_config_with_overrides
-
-    logger = logging.getLogger(__name__)
-
-    def parse_args() -> tuple[argparse.Namespace, list[str]]:
-        """Parse command-line arguments."""
-        parser = argparse.ArgumentParser(
-            description="SFT script for Nemotron Nano3",
-            formatter_class=argparse.RawTextHelpFormatter,
-        )
-        parser.add_argument(
-            "--config-file",
-            type=str,
-            default=None,
-            help="Path to YAML config file for overrides",
-        )
-
-        args, cli_overrides = parser.parse_known_args()
-        return args, cli_overrides
-
-    args, cli_overrides = parse_args()
-
-    config = nemotron_nano_9b_v2_finetune_config()
-
+def main() -> None:
+    """Entry point for Nemotron Nano3 supervised fine-tuning."""
     try:
-        config = process_config_with_overrides(
-            config,
-            config_filepath=args.config_file,
-            cli_overrides=cli_overrides or None,
-        )
+        config_path, cli_overrides = parse_config_and_overrides(default_config=DEFAULT_CONFIG_PATH)
+        config = load_omegaconf_yaml(config_path)
     except FileNotFoundError as e:
         logger.error(str(e))
         sys.exit(1)
 
-    main(config)
+    patch_wandb_http_handler_skip_digest_verification()
+
+    # Fix "Invalid Client ID digest" error caused by seeded random (wandb bug)
+    # See: https://github.com/wandb/wandb/pull/11039
+    patch_wandb_runid_for_seeded_random()
+
+    # Apply monkey patch for wandb checkpoint artifact logging
+    patch_wandb_checkpoint_logging()
+
+    # Resolve artifacts before wandb.init() (Megatron-Bridge initializes wandb).
+    qualified_names = register_resolvers_from_config(
+        config,
+        artifacts_key="run",
+        mode="pre_init",
+        pre_init_patch_http_digest=False,
+    )
+
+    # Patch wandb.init so lineage is registered immediately once MB initializes wandb.
+    patch_wandb_init_for_lineage(
+        artifact_qualified_names=qualified_names,
+        tags=["sft"],
+    )
+
+    recipe_target, recipe_kwargs = extract_recipe_config(
+        config,
+        default_target=DEFAULT_RECIPE_TARGET,
+    )
+    try:
+        recipe_func = import_recipe_function(recipe_target)
+    except Exception as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    cfg: ConfigContainer = recipe_func(**recipe_kwargs)
+
+    # Convert the initial Python dataclass to an OmegaConf DictConfig for merging
+    merged_omega_conf, excluded_fields = create_omegaconf_dict_config(cfg)
+
+    # Merge config overrides (excluding recipe field)
+    config_overrides = OmegaConf.to_container(config, resolve=False)
+    config_overrides.pop("recipe", None)
+
+    if config_overrides:
+        logger.debug(f"Merging config overrides: {list(config_overrides.keys())}")
+        yaml_overrides_omega = OmegaConf.create(config_overrides)
+        merged_omega_conf = OmegaConf.merge(merged_omega_conf, yaml_overrides_omega)
+        logger.debug("Config overrides merged successfully.")
+
+    # Apply command-line overrides using Hydra-style parsing
+    if cli_overrides:
+        logger.debug(f"Applying Hydra-style command-line overrides: {cli_overrides}")
+        merged_omega_conf = parse_hydra_overrides(merged_omega_conf, cli_overrides)
+        logger.debug("Hydra-style command-line overrides applied successfully.")
+
+    final_overrides_as_dict = OmegaConf.to_container(merged_omega_conf, resolve=True)
+    apply_overrides(cfg, final_overrides_as_dict, excluded_fields)
+
+    finetune(config=cfg, forward_step_func=forward_step)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

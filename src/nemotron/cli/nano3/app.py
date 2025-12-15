@@ -9,6 +9,8 @@ import typer
 
 from nemotron.cli.nano3.data import data_app
 from nemotron.cli.nano3.pretrain import pretrain
+from nemotron.cli.nano3.rl import rl
+from nemotron.cli.nano3.sft import sft
 
 # Create nano3 app
 nano3_app = typer.Typer(
@@ -29,6 +31,18 @@ nano3_app.command(
     },
 )(pretrain)
 
-# Future commands:
-# nano3_app.command("sft", ...)(sft)
-# nano3_app.command("rl", ...)(rl)
+nano3_app.command(
+    name="sft",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+    },
+)(sft)
+
+nano3_app.command(
+    name="rl",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+    },
+)(rl)

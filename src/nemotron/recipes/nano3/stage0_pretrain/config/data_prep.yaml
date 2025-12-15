@@ -9,7 +9,7 @@
 #   PWD: Current working directory (for blend_path resolution)
 
 # Path to data blend JSON file
-blend_path: ${oc.env:PWD}/src/nemotron/recipes/nano3/stage0_pretrain/data_blend_raw.json
+blend_path: ${oc.env:PWD}/src/nemotron/recipes/nano3/stage0_pretrain/config/data_blend_raw.json
 
 # Output directory for tokenized data
 output_dir: ${oc.env:NEMO_RUN_DIR,.}/output/nano3/stage0_pretrain

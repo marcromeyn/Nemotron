@@ -149,6 +149,8 @@ class ChatSftOutputConfig:
         chat_template: "nano3", path to .jinja file, or inline template string
         messages_field: Field name for messages in input records
         tools_field: Field name for tools in input records
+        used_in_filter: Filter to only include records where used_in contains this value
+        used_in_field: Field name for used_in filtering (default: "used_in")
     """
 
     format: Literal["chat_sft"] = "chat_sft"
@@ -162,6 +164,8 @@ class ChatSftOutputConfig:
     chat_template: str | None = None
     messages_field: str = "messages"
     tools_field: str = "tools"
+    used_in_filter: str | None = None
+    used_in_field: str = "used_in"
 
     def __post_init__(self) -> None:
         if self.shard_size is not None and self.num_shards is not None:

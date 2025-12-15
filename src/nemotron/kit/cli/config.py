@@ -152,14 +152,48 @@ def build_job_config(
     return job_config
 
 
+def _resolve_run_interpolations(obj: any, run_data: dict) -> any:
+    """Recursively resolve ${run.*} interpolations in a dict/list.
+
+    Only resolves ${run.X.Y} style interpolations, preserves other
+    interpolations like ${art:data,path}.
+
+    Args:
+        obj: Object to process (dict, list, or scalar)
+        run_data: The run section data to resolve from
+
+    Returns:
+        Object with ${run.*} interpolations resolved
+    """
+    if isinstance(obj, dict):
+        return {k: _resolve_run_interpolations(v, run_data) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_resolve_run_interpolations(item, run_data) for item in obj]
+    elif isinstance(obj, str) and obj.startswith("${run.") and obj.endswith("}"):
+        # Extract the path: ${run.wandb.project} -> wandb.project
+        path = obj[6:-1]  # Remove "${run." and "}"
+        # Navigate run_data to get the value
+        parts = path.split(".")
+        value = run_data
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return obj  # Can't resolve, keep original
+        return value
+    else:
+        return obj
+
+
 def extract_train_config(job_config: DictConfig) -> DictConfig:
     """Extract the script-only config from job config.
 
     Keeps only the fields needed for train.py:
     - All top-level config sections (recipe, train, model, logger, etc.)
-    - run.data, run.model (artifact references for ${art.X.path} resolution)
-    - run.wandb (for ${run.wandb.project} etc. interpolations)
-    - run.recipe (for ${run.recipe.name} interpolation)
+    - run.data, run.model (artifact references for ${art:X,path} resolution)
+
+    Resolves ${run.wandb.*} and ${run.recipe.*} interpolations directly
+    so the config is self-contained and doesn't need the full run section.
 
     Args:
         job_config: Full job configuration
@@ -167,31 +201,26 @@ def extract_train_config(job_config: DictConfig) -> DictConfig:
     Returns:
         Clean config suitable for train.py
     """
-    # Copy config without resolving interpolations
+    # Get config as dict without resolving (preserves ${art:...} interpolations)
     config_dict = OmegaConf.to_container(job_config, resolve=False)
 
-    # Extract needed fields from run section before removing it
+    # Extract run section - we'll use it to resolve ${run.*} interpolations
     run_section = config_dict.pop("run", {})
-    run_for_train = {}
 
-    # Keep artifact-like references (e.g., "DataBlendsArtifact-pretrain")
+    # Build a minimal run section with just artifact references
+    run_for_train = {}
     for key, value in run_section.items():
         if isinstance(value, str) and "Artifact" in value:
             run_for_train[key] = value
 
-    # Keep wandb config for logger interpolations
-    if "wandb" in run_section:
-        run_for_train["wandb"] = run_section["wandb"]
+    # Resolve ${run.wandb.*} and ${run.recipe.*} interpolations
+    resolved_config = _resolve_run_interpolations(config_dict, run_section)
 
-    # Keep recipe info for interpolations like ${run.recipe.name}
-    if "recipe" in run_section:
-        run_for_train["recipe"] = run_section["recipe"]
-
-    # Add minimal run section with needed fields
+    # Add minimal run section with needed fields (artifacts only)
     if run_for_train:
-        config_dict["run"] = run_for_train
+        resolved_config["run"] = run_for_train
 
-    return OmegaConf.create(config_dict)
+    return OmegaConf.create(resolved_config)
 
 
 def generate_job_dir(recipe_name: str, base_dir: Path | None = None) -> Path:

@@ -72,17 +72,45 @@ def _display_run_section(job_config: DictConfig) -> None:
     CONSOLE.print()
 
 
+def _resolve_run_interpolations(obj: any, run_data: dict) -> any:
+    """Recursively resolve ${run.*} interpolations in a dict/list.
+
+    Only resolves ${run.X.Y} style interpolations, preserves other
+    interpolations like ${art:data,path}.
+    """
+    if isinstance(obj, dict):
+        return {k: _resolve_run_interpolations(v, run_data) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_resolve_run_interpolations(item, run_data) for item in obj]
+    elif isinstance(obj, str) and obj.startswith("${run.") and obj.endswith("}"):
+        # Extract the path: ${run.wandb.project} -> wandb.project
+        path = obj[6:-1]  # Remove "${run." and "}"
+        parts = path.split(".")
+        value = run_data
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return obj  # Can't resolve, keep original
+        return value
+    else:
+        return obj
+
+
 def _display_config_section(job_config: DictConfig) -> None:
     """Display the training config as syntax-highlighted YAML."""
     # Create a copy without run section
     config_dict = OmegaConf.to_container(job_config, resolve=False)
-    config_dict.pop("run", None)
+    run_section = config_dict.pop("run", {})
 
     if not config_dict:
         return
 
+    # Resolve ${run.*} interpolations for display
+    resolved_config = _resolve_run_interpolations(config_dict, run_section)
+
     # Convert back to OmegaConf for YAML serialization
-    config_without_run = OmegaConf.create(config_dict)
+    config_without_run = OmegaConf.create(resolved_config)
     yaml_str = OmegaConf.to_yaml(config_without_run, resolve=False)
 
     syntax = Syntax(yaml_str.rstrip(), "yaml", theme=_get_theme(), line_numbers=False)

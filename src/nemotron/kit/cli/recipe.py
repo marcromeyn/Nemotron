@@ -351,12 +351,15 @@ def _execute_nemo_run(
     # Get experiment name from recipe
     recipe_name = job_config.run.recipe.name.replace("/", "-")
 
+    # Use uv run for ray jobs to ensure dependencies are installed
+    entrypoint = "uv run python" if ray else "python"
+
     with run.Experiment(recipe_name) as exp:
         exp.add(
             run.Script(
                 path="main.py",  # Flat name on remote
                 args=script_args,
-                entrypoint="python",
+                entrypoint=entrypoint,
             ),
             executor=executor,
             name=recipe_name,
@@ -831,7 +834,8 @@ def _print_stage_commands(
     ])
     if sqsh_path:
         srun_parts.append(f"--container-image={sqsh_path}")
-        srun_parts.append(f"--container-mounts={stage_dir}:{container_mount_path},/lustre:/lustre")
+        # Mount stage_dir to both /workspace and /nemo_run to match real nemo-run behavior
+        srun_parts.append(f"--container-mounts={stage_dir}:{container_mount_path},{stage_dir}:/nemo_run,/lustre:/lustre")
         srun_parts.append(f"--container-workdir={container_mount_path}")
     srun_parts.append("--pty bash")
     srun_cmd_display = " \\\n    ".join(srun_parts)
@@ -851,7 +855,7 @@ def _print_stage_commands(
     # Display
     console.print(Panel.fit(
         f"[bold cyan]Files staged to:[/bold cyan] {stage_dir}\n"
-        f"[bold cyan]Mounted at:[/bold cyan] {container_mount_path}\n"
+        f"[bold cyan]Mounted at:[/bold cyan] {container_mount_path} and /nemo_run\n"
         f"{env_info}\n"
         f"[bold cyan]1. SSH to cluster:[/bold cyan]\n"
         f"   [green]ssh {user}@{host}[/green]\n\n"
