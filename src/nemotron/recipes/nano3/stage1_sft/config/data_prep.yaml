@@ -12,7 +12,7 @@
 blend_path: ${oc.env:PWD}/src/nemotron/recipes/nano3/stage1_sft/config/data_blend_raw.json
 
 # Output directory for packed .npy data
-output_dir: ${oc.env:NEMO_RUN_DIR,.}/output/nano3/stage1_sft
+output_dir: ${oc.env:NEMO_RUN_DIR,.}/stage1_sft
 
 # HuggingFace tokenizer model name
 tokenizer_model: nvidia/NVIDIA-Nemotron-Nano-9B-v2

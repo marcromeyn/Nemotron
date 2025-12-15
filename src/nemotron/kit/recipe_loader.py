@@ -29,7 +29,7 @@ def extract_recipe_config(
 
     Expects:
         recipe:
-          __target__: some.module.func
+          _target_: some.module.func
           <other keys>: kwargs
     """
     if "recipe" not in config:
@@ -39,6 +39,6 @@ def extract_recipe_config(
     if not isinstance(recipe_dict, dict):
         return default_target, {}
 
-    target = str(recipe_dict.pop("__target__", default_target))
+    target = str(recipe_dict.pop("_target_", default_target))
     kwargs = recipe_dict
     return target, kwargs

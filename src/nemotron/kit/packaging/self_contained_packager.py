@@ -7,7 +7,9 @@ This module provides :class:`~nemotron.kit.packaging.self_contained_packager.Sel
 which builds a tarball containing only:
 
 - `main.py`: a single-file script produced by inlining `nemotron.*` imports
-- `config.yaml`: the resolved training config
+- `config.yaml`: the training config (paths should already be rewritten to /nemo_run/code
+  by ConfigBuilder.save() before this packager runs)
+- Any config files referenced in config.yaml (e.g., blend JSON files)
 
 The AST inliner is intentionally small and conservative:
 
@@ -20,24 +22,35 @@ from __future__ import annotations
 
 import ast
 import os
-import shutil
+import tarfile
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from nemo_run.core.packaging import Packager, PatternPackager
+from nemo_run.core.packaging import Packager
 
 
 @dataclass(kw_only=True)
 class SelfContainedPackager(Packager):
-    """Packager that produces a self-contained `main.py` by inlining `nemotron.*` imports."""
+    """Packager that produces a self-contained `main.py` by inlining `nemotron.*` imports.
+
+    Expects config.yaml to already have paths rewritten to /nemo_run/code/... by
+    ConfigBuilder.save(). Scans for those paths and includes the corresponding
+    local files in the tarball.
+    """
 
     script_path: str
     train_path: str
     inline_package: str = "nemotron"
+    remote_code_dir: str = "/nemo_run/code"
 
     def package(self, path: Path, job_dir: str, name: str) -> str:
-        """Create a tarball containing `main.py` and `config.yaml`.
+        """Create a tarball containing `main.py`, `config.yaml`, and referenced files.
+
+        The train_path config should already have paths rewritten to /nemo_run/code
+        by ConfigBuilder.save(). This method scans for those paths and includes
+        the corresponding local files in the tarball.
 
         Args:
             path: Repo root (nemo-run passes cwd for generic packagers).
@@ -47,6 +60,10 @@ class SelfContainedPackager(Packager):
         Returns:
             Path to the created tarball.
         """
+        from io import BytesIO
+
+        from omegaconf import OmegaConf
+
         repo_root = Path(path)
         output_file = os.path.join(job_dir, f"{name}.tar.gz")
         if os.path.exists(output_file):
@@ -59,30 +76,117 @@ class SelfContainedPackager(Packager):
         if not script_file.is_absolute():
             script_file = repo_root / self.script_path
 
+        # Inline nemotron imports into main.py
         inlined = inline_imports(
             script_file,
             repo_root=repo_root,
             package_prefix=self.inline_package,
         )
-        (staging_dir / "main.py").write_text(inlined, encoding="utf-8")
 
-        shutil.copy2(Path(self.train_path), staging_dir / "config.yaml")
+        # Load config (already has paths rewritten to /nemo_run/code)
+        # Resolve most interpolations, but preserve ${art:...} which requires runtime resolution
+        config = OmegaConf.load(self.train_path)
+        config_dict = _to_container_preserve_art(config)
 
-        packager = PatternPackager(
-            include_pattern=[str(staging_dir / "main.py"), str(staging_dir / "config.yaml")],
-            relative_path=[str(staging_dir), str(staging_dir)],
-        )
+        # Scan config for /nemo_run/code paths and collect corresponding local files
+        extra_files: list[tuple[str, str]] = []  # (local_path, archive_path)
+        self._collect_referenced_files(config_dict, repo_root, extra_files)
 
+        # Build tarball manually to include extra files
         # On macOS, bsdtar can include AppleDouble `._*` entries unless disabled.
         prev = os.environ.get("COPYFILE_DISABLE")
         os.environ["COPYFILE_DISABLE"] = "1"
         try:
-            return packager.package(repo_root, job_dir, name)
+            with tarfile.open(output_file, "w:gz") as tf:
+                # Add main.py
+                main_info = tarfile.TarInfo(name="main.py")
+                main_data = inlined.encode("utf-8")
+                main_info.size = len(main_data)
+                main_info.mode = 0o644
+                tf.addfile(main_info, BytesIO(main_data))
+
+                # Add config.yaml (copy from train_path which already has rewritten paths)
+                tf.add(self.train_path, arcname="config.yaml")
+
+                # Add extra referenced files with their relative paths
+                for local_path, archive_path in extra_files:
+                    if Path(local_path).exists():
+                        tf.add(local_path, arcname=archive_path)
+
+            return output_file
         finally:
             if prev is None:
                 os.environ.pop("COPYFILE_DISABLE", None)
             else:
                 os.environ["COPYFILE_DISABLE"] = prev
+
+    def _collect_referenced_files(
+        self, obj: Any, repo_root: Path, extra_files: list[tuple[str, str]]
+    ) -> None:
+        """Recursively scan config for /nemo_run/code paths and collect local files.
+
+        When paths like /nemo_run/code/src/... are found, the corresponding local
+        files (repo_root/src/...) are added to extra_files for tarball inclusion.
+
+        Args:
+            obj: Config object (dict, list, or scalar)
+            repo_root: Local repository root
+            extra_files: List to collect (local_path, archive_path) tuples
+        """
+        if isinstance(obj, dict):
+            for v in obj.values():
+                self._collect_referenced_files(v, repo_root, extra_files)
+        elif isinstance(obj, list):
+            for v in obj:
+                self._collect_referenced_files(v, repo_root, extra_files)
+        elif isinstance(obj, str):
+            # Check if it's a /nemo_run/code path
+            if obj.startswith(self.remote_code_dir + "/"):
+                # Extract relative path after /nemo_run/code/
+                rel_path = obj[len(self.remote_code_dir) + 1:]
+                local_path = repo_root / rel_path
+                # If the local file exists, add to extra_files
+                if local_path.exists() and local_path.is_file():
+                    extra_files.append((str(local_path), rel_path))
+
+
+def _to_container_preserve_art(config: Any) -> Any:
+    """Convert OmegaConf config to container, resolving all interpolations except ${art:...}.
+
+    The ${art:...} interpolations require runtime artifact resolution and must be preserved.
+    All other interpolations (like ${run.wandb.project}) are resolved at packaging time.
+
+    Args:
+        config: OmegaConf DictConfig or ListConfig
+
+    Returns:
+        Plain dict/list with interpolations resolved except ${art:...}
+    """
+    from omegaconf import DictConfig, ListConfig, OmegaConf
+
+    def _convert(obj: Any) -> Any:
+        if isinstance(obj, DictConfig):
+            result = {}
+            for key in obj.keys():
+                # Get the raw value to check if it's an ${art:...} interpolation
+                raw_node = OmegaConf.to_container(obj, resolve=False).get(key)
+                if isinstance(raw_node, str) and "${art:" in raw_node:
+                    # Preserve ${art:...} interpolations as-is
+                    result[key] = raw_node
+                else:
+                    # Resolve and convert recursively
+                    try:
+                        result[key] = _convert(obj[key])
+                    except Exception:
+                        # If resolution fails, keep raw value
+                        result[key] = raw_node
+            return result
+        elif isinstance(obj, ListConfig):
+            return [_convert(item) for item in obj]
+        else:
+            return obj
+
+    return _convert(config)
 
 
 def _read_text(path: Path) -> str:

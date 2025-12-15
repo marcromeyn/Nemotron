@@ -185,7 +185,51 @@ def _resolve_run_interpolations(obj: any, run_data: dict) -> any:
         return obj
 
 
-def extract_train_config(job_config: DictConfig) -> DictConfig:
+def _rewrite_paths_for_remote(obj: any, repo_root: Path) -> any:
+    """Recursively rewrite paths for remote execution.
+
+    Rewrites:
+    - ${oc.env:PWD}/... → /nemo_run/code/...
+    - ${oc.env:NEMO_RUN_DIR,...}/... → /nemo_run/...
+    - Absolute paths under repo_root → /nemo_run/code/...
+
+    Args:
+        obj: Object to process (dict, list, or scalar)
+        repo_root: Local repository root path
+
+    Returns:
+        Object with paths rewritten for remote execution
+    """
+    import re
+
+    if isinstance(obj, dict):
+        return {k: _rewrite_paths_for_remote(v, repo_root) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_rewrite_paths_for_remote(item, repo_root) for item in obj]
+    elif isinstance(obj, str):
+        # Rewrite ${oc.env:PWD}/... to /nemo_run/code/...
+        if "${oc.env:PWD}" in obj:
+            return obj.replace("${oc.env:PWD}", "/nemo_run/code")
+
+        # Rewrite ${oc.env:NEMO_RUN_DIR,...}/... to /nemo_run/...
+        # Handles both ${oc.env:NEMO_RUN_DIR} and ${oc.env:NEMO_RUN_DIR,.}
+        match = re.match(r'\$\{oc\.env:NEMO_RUN_DIR[^}]*\}(.*)', obj)
+        if match:
+            suffix = match.group(1)
+            return f"/nemo_run{suffix}"
+
+        # Rewrite absolute paths under repo_root to /nemo_run/code/...
+        repo_root_str = str(repo_root)
+        if obj.startswith(repo_root_str):
+            rel_path = obj[len(repo_root_str):].lstrip("/")
+            return f"/nemo_run/code/{rel_path}"
+
+    return obj
+
+
+def extract_train_config(
+    job_config: DictConfig, *, for_remote: bool = False
+) -> DictConfig:
     """Extract the script-only config from job config.
 
     Keeps only the fields needed for train.py:
@@ -195,32 +239,57 @@ def extract_train_config(job_config: DictConfig) -> DictConfig:
     Resolves ${run.wandb.*} and ${run.recipe.*} interpolations directly
     so the config is self-contained and doesn't need the full run section.
 
+    When for_remote=True, also rewrites paths for remote execution:
+    - ${oc.env:PWD}/... → /nemo_run/code/...
+    - ${oc.env:NEMO_RUN_DIR,...}/... → /nemo_run/...
+
     Args:
         job_config: Full job configuration
+        for_remote: If True, rewrite paths for remote execution
 
     Returns:
         Clean config suitable for train.py
     """
-    # Get config as dict without resolving (preserves ${art:...} interpolations)
-    config_dict = OmegaConf.to_container(job_config, resolve=False)
+    if for_remote:
+        # Get config without resolving interpolations
+        config_dict = OmegaConf.to_container(job_config, resolve=False)
+        run_section = config_dict.pop("run", {})
 
-    # Extract run section - we'll use it to resolve ${run.*} interpolations
-    run_section = config_dict.pop("run", {})
+        # Rewrite paths for remote execution
+        repo_root = Path.cwd()
+        config_dict = _rewrite_paths_for_remote(config_dict, repo_root)
 
-    # Build a minimal run section with just artifact references
-    run_for_train = {}
-    for key, value in run_section.items():
-        if isinstance(value, str) and "Artifact" in value:
-            run_for_train[key] = value
+        # Build a minimal run section with just artifact references
+        run_for_train = {}
+        for key, value in run_section.items():
+            if isinstance(value, str) and "Artifact" in value:
+                run_for_train[key] = value
 
-    # Resolve ${run.wandb.*} and ${run.recipe.*} interpolations
-    resolved_config = _resolve_run_interpolations(config_dict, run_section)
+        if run_for_train:
+            config_dict["run"] = run_for_train
 
-    # Add minimal run section with needed fields (artifacts only)
-    if run_for_train:
-        resolved_config["run"] = run_for_train
+        return OmegaConf.create(config_dict)
+    else:
+        # Get config as dict without resolving (preserves ${art:...} interpolations)
+        config_dict = OmegaConf.to_container(job_config, resolve=False)
 
-    return OmegaConf.create(resolved_config)
+        # Extract run section - we'll use it to resolve ${run.*} interpolations
+        run_section = config_dict.pop("run", {})
+
+        # Build a minimal run section with just artifact references
+        run_for_train = {}
+        for key, value in run_section.items():
+            if isinstance(value, str) and "Artifact" in value:
+                run_for_train[key] = value
+
+        # Resolve ${run.wandb.*} and ${run.recipe.*} interpolations
+        resolved_config = _resolve_run_interpolations(config_dict, run_section)
+
+        # Add minimal run section with needed fields (artifacts only)
+        if run_for_train:
+            resolved_config["run"] = run_for_train
+
+        return OmegaConf.create(resolved_config)
 
 
 def generate_job_dir(recipe_name: str, base_dir: Path | None = None) -> Path:
@@ -349,10 +418,18 @@ class ConfigBuilder:
 
         return self._job_config
 
-    def save(self) -> tuple[Path, Path]:
+    def save(self, *, rewrite_paths: bool | None = None, packager: str = "pattern") -> tuple[Path, Path]:
         """Save configs to disk.
 
         Must call build_job_config() first.
+
+        Args:
+            rewrite_paths: If True, rewrite paths for /nemo_run/code. If False, keep
+                original paths/interpolations. If None (default), auto-detect based
+                on execution mode AND packager type.
+            packager: Packager type. When "code", paths are NOT rewritten since
+                the code is rsynced and runs from the rsynced location where
+                ${oc.env:PWD} resolves correctly at runtime.
 
         Returns:
             Tuple of (job_yaml_path, train_yaml_path)
@@ -361,7 +438,16 @@ class ConfigBuilder:
             self.build_job_config()
 
         self._job_dir = generate_job_dir(self.recipe_name)
-        train_config = extract_train_config(self._job_config)
+
+        # Determine whether to rewrite paths for remote execution
+        if rewrite_paths is None:
+            # Default: rewrite for --run/--batch mode, but NOT for "code" packager
+            # Code packager rsyncs the repo and runs from there, so paths resolve at runtime
+            for_remote = self.ctx.mode in ("run", "batch") and packager != "code"
+        else:
+            for_remote = rewrite_paths
+
+        train_config = extract_train_config(self._job_config, for_remote=for_remote)
 
         return save_configs(self._job_config, train_config, self._job_dir)
 

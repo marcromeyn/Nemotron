@@ -731,6 +731,7 @@ def run_with_nemo_run(
     run_config: RunConfig,
     ray: bool = False,
     pre_ray_start_commands: list[str] | None = None,
+    packager: str = "code",
 ) -> int:
     """Execute script via nemo-run, optionally with Ray.
 
@@ -740,6 +741,7 @@ def run_with_nemo_run(
         run_config: Run configuration for executor.
         ray: Whether to use Ray for execution.
         pre_ray_start_commands: Commands to run before Ray starts.
+        packager: Packager type ("code", "self_contained", "pattern").
 
     Returns:
         Exit code (0 = success).
@@ -793,6 +795,15 @@ def run_with_nemo_run(
             "find . -type d -name __pycache__ -delete 2>/dev/null || true",
             "uv sync --reinstall-package nemotron",
         ]
+
+        # For self_contained packager, copy files from /nemo_run/code to working dir
+        # This is needed because uv run requires being in the correct workspace,
+        # but the packager extracts files to /nemo_run/code
+        if packager == "self_contained":
+            setup_commands.extend([
+                "cp /nemo_run/code/main.py .",
+                "cp /nemo_run/code/config.yaml .",
+            ])
 
         # Prepend log clearing if remote_job_dir is configured
         if log_clear_cmd:

@@ -14,7 +14,7 @@ def test_extract_recipe_config_reads_target_and_kwargs():
     cfg = OmegaConf.create(
         {
             "recipe": {
-                "__target__": "m.n.func",
+                "_target_": "m.n.func",
                 "alpha": 1,
                 "beta": "x",
             }

@@ -196,14 +196,16 @@ def recipe(
             builder.build_job_config()
 
             # Display compiled configuration
-            display_job_config(builder.job_config)
+            # Show resolved paths for remote execution (--run/--batch), but not for "code" packager
+            for_remote = global_ctx.mode in ("run", "batch") and packager != "code"
+            display_job_config(builder.job_config, for_remote=for_remote)
 
             # Handle dry-run mode
             if global_ctx.dry_run:
                 return
 
             # Save configs
-            job_path, train_path = builder.save()
+            job_path, train_path = builder.save(packager=packager)
 
             # Handle stage-only mode
             if global_ctx.stage:
@@ -217,8 +219,14 @@ def recipe(
                 )
                 return
 
+            # Extract env config for building env vars
+            env_config = None
+            if hasattr(builder.job_config, "run") and hasattr(builder.job_config.run, "env"):
+                from omegaconf import OmegaConf
+                env_config = OmegaConf.to_container(builder.job_config.run.env, resolve=True)
+
             # Build env vars for display (needs job_config for wandb settings)
-            env_vars = _build_env_vars(builder.job_config)
+            env_vars = _build_env_vars(builder.job_config, env_config)
 
             # Display job submission summary
             display_job_submission(job_path, train_path, env_vars, global_ctx.mode)
@@ -324,6 +332,8 @@ def _execute_nemo_run(
         torchrun: Whether to use torchrun launcher
         ray: Whether this recipe requires Ray
     """
+    import time
+
     try:
         import nemo_run as run
     except ImportError:
@@ -351,20 +361,93 @@ def _execute_nemo_run(
     # Get experiment name from recipe
     recipe_name = job_config.run.recipe.name.replace("/", "-")
 
-    # Use uv run for ray jobs to ensure dependencies are installed
-    entrypoint = "uv run python" if ray else "python"
+    if ray:
+        # Use RayJob for Ray-based recipes
+        import shutil
 
-    with run.Experiment(recipe_name) as exp:
-        exp.add(
-            run.Script(
-                path="main.py",  # Flat name on remote
-                args=script_args,
-                entrypoint=entrypoint,
-            ),
-            executor=executor,
-            name=recipe_name,
+        from nemo_run.run.ray.job import RayJob
+
+        # Generate unique job name to prevent directory collisions
+        job_name = f"{recipe_name}_{int(time.time())}"
+        ray_job = RayJob(name=job_name, executor=executor)
+
+        # Copy train.yaml to repo root so it gets rsynced
+        # This ensures the config with rewritten paths is available on remote
+        repo_config = Path.cwd() / "config.yaml"
+        shutil.copy2(train_path, repo_config)
+
+        # Setup commands to prepare the environment before running
+        setup_commands = [
+            "find . -type d -name __pycache__ -delete 2>/dev/null || true",
+            "uv sync --reinstall-package nemotron",
+        ]
+
+        # Get the actual script path from the recipe config
+        actual_script = job_config.run.recipe.script
+
+        # Build the command to run using actual script path and config.yaml at repo root
+        cmd = f"uv run python {actual_script} --config config.yaml"
+        if passthrough:
+            cmd += " " + " ".join(passthrough)
+
+        # Build runtime_env with environment variables for Ray workers
+        runtime_env: dict = {"env_vars": dict(env_vars)}
+
+        # Create temporary runtime_env YAML file
+        import tempfile
+
+        import yaml as pyyaml
+
+        runtime_env_yaml = None
+        if runtime_env["env_vars"]:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False
+            ) as f:
+                pyyaml.dump(runtime_env, f)
+                runtime_env_yaml = f.name
+
+        ray_job.start(
+            command=cmd,
+            workdir=".",
+            pre_ray_start_commands=setup_commands,
+            runtime_env_yaml=runtime_env_yaml,
         )
-        exp.run(detach=not attached)
+
+        # Workaround for nemo-run bug: when reusing an existing cluster,
+        # SlurmRayCluster.create() returns None instead of the job_id.
+        if ray_job.backend.job_id is None:
+            status = ray_job.backend.status(display=False)
+            if status and status.get("job_id"):
+                ray_job.backend.job_id = status["job_id"]
+                typer.echo(f"[info] Recovered job_id {status['job_id']} from cluster status")
+
+        if attached:
+            try:
+                # Wait up to 10 minutes for log file to appear
+                ray_job.logs(follow=True, timeout=600)
+            except KeyboardInterrupt:
+                typer.echo("\n[info] Ctrl-C detected, stopping Ray cluster...")
+                try:
+                    ray_job.stop()
+                    typer.echo("[info] Ray cluster stopped")
+                except Exception as e:
+                    typer.echo(f"[warning] Failed to stop Ray cluster: {e}")
+                raise typer.Exit(130)
+    else:
+        # Standard execution via nemo-run Script
+        entrypoint = "python"
+
+        with run.Experiment(recipe_name) as exp:
+            exp.add(
+                run.Script(
+                    path="main.py",  # Flat name on remote
+                    args=script_args,
+                    entrypoint=entrypoint,
+                ),
+                executor=executor,
+                name=recipe_name,
+            )
+            exp.run(detach=not attached)
 
 
 def _build_executor(
@@ -473,26 +556,43 @@ def _build_executor(
         raise ValueError(f"Unknown executor type: {executor_type}")
 
 
-def _build_env_vars(job_config: Any) -> dict:
+def _build_env_vars(job_config: Any, env_config: dict | None = None) -> dict:
     """Build environment variables for nemo-run execution.
 
     Sets up:
     - NEMO_RUN_DIR for output paths
+    - HF_HOME for HuggingFace cache (defaults to remote_job_dir/hf)
     - HF_TOKEN if logged in to HuggingFace
     - WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT if logged in to W&B
 
     Args:
         job_config: Full job configuration (contains run.wandb section)
+        env_config: Environment configuration from env.toml (contains remote_job_dir)
 
     Returns:
         Dictionary of environment variables
     """
+    import os
+
     from omegaconf import OmegaConf
 
     env_vars: dict[str, str] = {}
 
-    # Set NEMO_RUN_DIR to experiment root for output paths
-    env_vars["NEMO_RUN_DIR"] = "/nemo_run"
+    # Set NEMO_RUN_DIR to actual lustre path for output paths
+    # This ensures artifacts store the real path, not /nemo_run container mount
+    if env_config and env_config.get("remote_job_dir"):
+        env_vars["NEMO_RUN_DIR"] = env_config["remote_job_dir"]
+    else:
+        # Fallback to container mount if remote_job_dir not configured
+        env_vars["NEMO_RUN_DIR"] = "/nemo_run"
+
+    # Set HF_HOME to remote_job_dir/hf if not explicitly set by user
+    # This ensures HuggingFace downloads go to Lustre storage with sufficient space
+    if os.environ.get("HF_HOME"):
+        # Respect user's explicit HF_HOME setting
+        env_vars["HF_HOME"] = os.environ["HF_HOME"]
+    elif env_config and env_config.get("remote_job_dir"):
+        env_vars["HF_HOME"] = f"{env_config['remote_job_dir']}/hf"
 
     # Auto-detect HuggingFace token
     try:
@@ -748,7 +848,7 @@ def _execute_stage_only(
     local_config = code_dir / "config.yaml"
 
     # Build environment variables (same as _execute_nemo_run)
-    env_vars = _build_env_vars(job_config)
+    env_vars = _build_env_vars(job_config, env_config)
 
     # Get GPU count for torchrun
     gpus = env_config.get("gpus_per_node") or env_config.get("ntasks_per_node", 8)

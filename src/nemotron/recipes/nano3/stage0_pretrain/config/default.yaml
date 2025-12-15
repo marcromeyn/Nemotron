@@ -5,10 +5,10 @@
 #   python train.py --config /path/to/config.yaml train.train_iters=5000
 
 # Recipe configuration
-# __target__ specifies the recipe function (defaults to nemotron_next_3b_v2_pretrain_config if omitted)
+# _target_ specifies the recipe function (defaults to nemotron_next_3b_v2_pretrain_config if omitted)
 # Other fields are passed as kwargs to the recipe function
 recipe:
-  __target__: megatron.bridge.recipes.nemotronh.nemotron_next_3b_v2.nemotron_next_3b_v2_pretrain_config
+  _target_: megatron.bridge.recipes.nemotronh.nemotron_next_3b_v2.nemotron_next_3b_v2_pretrain_config
   per_split_data_args_path: null  # Path to per-split data args file (blend.json)
   # Additional recipe kwargs:
   # tensor_model_parallel_size: 4

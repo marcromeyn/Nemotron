@@ -72,12 +72,14 @@ class CodePackager(Packager):
 
         # The launcher runs in the extracted package root.
         # Add `src/` so `import nemotron` works without installation.
+        # Change working directory to ROOT so ${oc.env:PWD} resolves correctly.
         return (
             "from __future__ import annotations\n\n"
             "import os\n"
             "import runpy\n"
             "import sys\n\n"
             "ROOT = os.path.dirname(__file__)\n"
+            "os.chdir(ROOT)\n"
             "sys.path.insert(0, ROOT)\n"
             "sys.path.insert(0, os.path.join(ROOT, 'src'))\n\n"
             f"runpy.run_path(os.path.join(ROOT, {rel_script.as_posix()!r}), run_name='__main__')\n"

@@ -21,7 +21,7 @@ CONFIG_DIR = "src/nemotron/recipes/nano3/stage2_rl/config"
     default_config="tiny",
     torchrun=False,
     ray=True,
-    packager="code",
+    packager="self_contained",
 )
 def rl(ctx: typer.Context) -> None:
     """Run reinforcement learning with NeMo-RL GRPO (stage2).

@@ -32,13 +32,14 @@ def _get_theme() -> str:
     return DEFAULT_THEME
 
 
-def display_job_config(job_config: DictConfig) -> None:
+def display_job_config(job_config: DictConfig, *, for_remote: bool = False) -> None:
     """Display the full job configuration as syntax-highlighted YAML.
 
     Config is flat - training config at root, run section has execution/provenance.
 
     Args:
         job_config: The compiled job configuration
+        for_remote: If True, resolve all interpolations and rewrite paths for remote execution
     """
     CONSOLE.print()
     CONSOLE.print("[bold cyan]Compiled Configuration[/bold cyan]")
@@ -48,7 +49,7 @@ def display_job_config(job_config: DictConfig) -> None:
     _display_run_section(job_config)
 
     # Display training config (everything except run section)
-    _display_config_section(job_config)
+    _display_config_section(job_config, for_remote=for_remote)
 
     CONSOLE.print()
 
@@ -97,20 +98,59 @@ def _resolve_run_interpolations(obj: any, run_data: dict) -> any:
         return obj
 
 
-def _display_config_section(job_config: DictConfig) -> None:
+def _rewrite_paths_for_remote(obj: any, repo_root_str: str) -> any:
+    """Recursively rewrite paths for remote execution display.
+
+    Rewrites:
+    - ${oc.env:PWD}/... → /nemo_run/code/...
+    - ${oc.env:NEMO_RUN_DIR,...}/... → /nemo_run/...
+    - Absolute paths under repo_root → /nemo_run/code/...
+    """
+    import re
+
+    if isinstance(obj, dict):
+        return {k: _rewrite_paths_for_remote(v, repo_root_str) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_rewrite_paths_for_remote(item, repo_root_str) for item in obj]
+    elif isinstance(obj, str):
+        # Rewrite ${oc.env:PWD}/... to /nemo_run/code/...
+        if "${oc.env:PWD}" in obj:
+            return obj.replace("${oc.env:PWD}", "/nemo_run/code")
+
+        # Rewrite ${oc.env:NEMO_RUN_DIR,...}/... to /nemo_run/...
+        match = re.match(r'\$\{oc\.env:NEMO_RUN_DIR[^}]*\}(.*)', obj)
+        if match:
+            suffix = match.group(1)
+            return f"/nemo_run{suffix}"
+
+        # Rewrite absolute paths under repo_root to /nemo_run/code/...
+        if obj.startswith(repo_root_str):
+            rel_path = obj[len(repo_root_str):].lstrip("/")
+            return f"/nemo_run/code/{rel_path}"
+
+    return obj
+
+
+def _display_config_section(job_config: DictConfig, *, for_remote: bool = False) -> None:
     """Display the training config as syntax-highlighted YAML."""
-    # Create a copy without run section
+    # Create a copy without resolving interpolations
     config_dict = OmegaConf.to_container(job_config, resolve=False)
     run_section = config_dict.pop("run", {})
 
     if not config_dict:
         return
 
-    # Resolve ${run.*} interpolations for display
-    resolved_config = _resolve_run_interpolations(config_dict, run_section)
+    if for_remote:
+        # Rewrite paths for remote execution display
+        import os
+        repo_root_str = os.getcwd()
+        config_dict = _rewrite_paths_for_remote(config_dict, repo_root_str)
+    else:
+        # Resolve ${run.*} interpolations for display
+        config_dict = _resolve_run_interpolations(config_dict, run_section)
 
     # Convert back to OmegaConf for YAML serialization
-    config_without_run = OmegaConf.create(resolved_config)
+    config_without_run = OmegaConf.create(config_dict)
     yaml_str = OmegaConf.to_yaml(config_without_run, resolve=False)
 
     syntax = Syntax(yaml_str.rstrip(), "yaml", theme=_get_theme(), line_numbers=False)
