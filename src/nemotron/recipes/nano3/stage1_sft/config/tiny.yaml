@@ -1,5 +1,5 @@
 run:
-  data: DataBlendsArtifact-sft:latest
+  data: SFTDataArtifact-sft:latest
   model: pretrain:latest
   env:
     container: nvcr.io/nvidian/nemo:25.11-nano-v3.rc2
@@ -12,10 +12,10 @@ recipe:
 dataset:
   _target_: megatron.bridge.training.config.FinetuningDatasetConfig
   dataset_root: ${art:data,path}
-  seq_length: ${art:data,metadata.pack_size}
+  seq_length: ${art:data,pack_size}
   packed_sequence_specs:
     _target_: megatron.bridge.data.datasets.packed_sequence.PackedSequenceSpecs
-    packed_sequence_size: ${art:data,metadata.pack_size}
+    packed_sequence_size: ${art:data,pack_size}
     packed_train_data_path: ${art:data,path}/training.npy
     packed_val_data_path: ${art:data,path}/validation.npy
     packed_metadata_path: ${art:data,path}/metadata.json

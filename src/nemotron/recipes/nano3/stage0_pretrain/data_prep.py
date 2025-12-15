@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from nemotron.data_prep import DataPrepConfig, PerSplitConfig, run_data_prep
-from nemotron.kit import DataBlendsArtifact, print_step_complete
+from nemotron.kit import PretrainDataArtifact, print_step_complete
 from nemotron.kit.train_script import (
     apply_hydra_overrides,
     init_wandb_from_env,
@@ -112,14 +112,14 @@ class PreTrainDataPrepConfig:
             self.output_dir = self.output_dir / f"sample-{self.sample}"
 
 
-def run_data_prep_main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
+def run_data_prep_main(cfg: PreTrainDataPrepConfig) -> PretrainDataArtifact:
     """Run pretrain data preparation.
 
     Args:
         cfg: Data prep configuration.
 
     Returns:
-        DataBlendsArtifact with paths to tokenized data.
+        PretrainDataArtifact with paths to tokenized data.
     """
     # Add stage-specific tags to wandb run
     add_wandb_tags(["data-prep", "pretrain"])
@@ -152,14 +152,14 @@ def run_data_prep_main(cfg: PreTrainDataPrepConfig) -> DataBlendsArtifact:
     return artifact
 
 
-def main(cfg: PreTrainDataPrepConfig | None = None) -> DataBlendsArtifact:
+def main(cfg: PreTrainDataPrepConfig | None = None) -> PretrainDataArtifact:
     """Entry point for pretrain data preparation.
 
     Args:
         cfg: Config from CLI framework, or None when run directly as script.
 
     Returns:
-        DataBlendsArtifact with paths to tokenized data.
+        PretrainDataArtifact with paths to tokenized data.
     """
     if cfg is None:
         # Called directly as script - parse config ourselves

@@ -79,7 +79,7 @@ from nemotron.data_prep.formats.transforms import (
     OpenAIChatRecord,
     ShareGPTRecord,
 )
-from nemotron.kit.artifact import DataBlendsArtifact
+from nemotron.kit.artifact import DataBlendsArtifact, PretrainDataArtifact
 from nemotron.kit.trackers import InputDatasetInfo, tokenizer_to_uri
 from nemotron.kit.wandb import finish_wandb
 from nemotron.data_prep.discovery import get_dataset_metadata
@@ -154,7 +154,7 @@ class DataPrepConfig:
     """Semantic artifact name (e.g., 'nano3/pretrain/data')"""
 
 
-def run_data_prep(config: DataPrepConfig) -> DataBlendsArtifact:
+def run_data_prep(config: DataPrepConfig, *, artifact_class: type = PretrainDataArtifact) -> DataBlendsArtifact | PretrainDataArtifact:
     """Execute data preparation pipeline.
 
     Loads the data blend, tokenizes all datasets, and produces a
@@ -162,9 +162,10 @@ def run_data_prep(config: DataPrepConfig) -> DataBlendsArtifact:
 
     Args:
         config: Data preparation configuration
+        artifact_class: Artifact class to use for output (default: PretrainDataArtifact)
 
     Returns:
-        DataBlendsArtifact with blend.json path and metrics
+        Artifact instance with blend.json path and metrics
 
     Example:
         >>> from nemotron.data_prep import DataPrepConfig, run_data_prep
@@ -287,22 +288,13 @@ def run_data_prep(config: DataPrepConfig) -> DataBlendsArtifact:
     # Create tokenizer URI for lineage tracking
     tok_uri = tokenizer_to_uri(config.tokenizer_model)
 
-    # Extract per-split token counts from result.splits
-    # In per-split mode: splits has "train", "valid", "test" keys
-    # In single-blend mode: splits has "all" key (per-split counts are None)
-    train_tokens = result.splits["train"].total_tokens if "train" in result.splits else None
-    valid_tokens = result.splits["valid"].total_tokens if "valid" in result.splits else None
-    test_tokens = result.splits["test"].total_tokens if "test" in result.splits else None
-
     # Build output artifact - path points to blend.json
-    artifact = DataBlendsArtifact(
+    artifact = artifact_class(
         path=result.blend_path,
         total_tokens=result.total_tokens,
         total_sequences=result.total_sequences,
         elapsed_sec=result.elapsed_sec,
-        train_tokens=train_tokens,
-        valid_tokens=valid_tokens,
-        test_tokens=test_tokens,
+        num_shards=num_shards,
         source_datasets=source_datasets,
         tokenizer_uri=tok_uri,
         name=config.artifact_name,  # Semantic name for W&B artifact naming

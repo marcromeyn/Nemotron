@@ -138,7 +138,7 @@ mounts = ["/lustre:/lustre"]
 
 > **Note**: Container images are specified in the recipe config files (e.g., `config/tiny.yaml`), not in env.toml.
 
-See [nemo-run.md](../nemo-run.md) for complete configuration options.
+See [nemo-run.md](../../nemo-run.md) for complete configuration options.
 
 ## Quick Start
 
@@ -321,9 +321,10 @@ nemotron nano3 pretrain --help
 - [Stage 0: Pretraining](./pretrain.md) - Train the base model on large text corpus
 - [Stage 1: SFT](./sft.md) - Supervised fine-tuning for instruction following
 - [Stage 2: RL](./rl.md) - Reinforcement learning for alignment
+- [Importing Models & Data](./import.md) - Import existing checkpoints and data as W&B artifacts
 
 ## Further Reading
 
-- [NeMo-Run Configuration](../nemo-run.md) - Complete guide to env.toml and execution profiles
-- [Data Preparation](../data_prep.md) - Detailed data preparation documentation
-- [Recipe Source](../../src/nemotron/recipes/nano3/) - Stage-specific README files with implementation details
+- [NeMo-Run Configuration](../../nemo-run.md) - Complete guide to env.toml and execution profiles
+- [Data Preparation](../../data_prep.md) - Detailed data preparation documentation
+- [Recipe Source](../../../src/nemotron/recipes/nano3/) - Stage-specific README files with implementation details

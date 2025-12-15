@@ -497,6 +497,8 @@ class WandbTracker:
                 wb_artifact.add_file(str(artifact_path), name="blend.json")
             else:
                 # Generic artifact - add directory reference
+                # Use checksum=False to avoid digest mismatch errors when files change
+                # between data prep runs (the path is what matters for lineage)
                 if artifact_path.is_file():
                     artifact_path = artifact_path.parent
                 output_uri = f"file://{artifact_path.resolve()}"
@@ -504,7 +506,7 @@ class WandbTracker:
                     wb_artifact.add_reference(
                         output_uri,
                         name="output",
-                        checksum=True,
+                        checksum=False,
                     )
                 except Exception:
                     # Fallback to add_dir if reference fails

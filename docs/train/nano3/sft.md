@@ -305,7 +305,7 @@ nemotron nano3 sft -c tiny --batch YOUR-CLUSTER
 nemotron nano3 sft -c tiny --run YOUR-CLUSTER --dry-run
 ```
 
-See [nemo-run.md](../nemo-run.md) for complete configuration options.
+See [nemo-run.md](../../nemo-run.md) for complete configuration options.
 
 ## Artifact Lineage
 
@@ -335,5 +335,5 @@ After SFT completes, proceed to [Stage 2: RL](./rl.md) for alignment training.
 
 ## Reference
 
-- [Recipe Source](../../src/nemotron/recipes/nano3/stage1_sft/) - Implementation details
+- [Recipe Source](../../../src/nemotron/recipes/nano3/stage1_sft/) - Implementation details
 - [Back to Overview](./README.md)

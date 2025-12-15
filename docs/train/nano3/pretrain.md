@@ -275,7 +275,7 @@ nemotron nano3 pretrain -c tiny --batch YOUR-CLUSTER
 nemotron nano3 pretrain -c tiny --run YOUR-CLUSTER --dry-run
 ```
 
-See [nemo-run.md](../nemo-run.md) for complete configuration options.
+See [nemo-run.md](../../nemo-run.md) for complete configuration options.
 
 ## Artifact Lineage
 
@@ -299,5 +299,5 @@ After pretraining completes, proceed to [Stage 1: SFT](./sft.md) for instruction
 
 ## Reference
 
-- [Recipe Source](../../src/nemotron/recipes/nano3/stage0_pretrain/) - Implementation details
+- [Recipe Source](../../../src/nemotron/recipes/nano3/stage0_pretrain/) - Implementation details
 - [Back to Overview](./README.md)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import typer
 
 from nemotron.cli.nano3.data import data_app
+from nemotron.cli.nano3.model import model_app
 from nemotron.cli.nano3.pretrain import pretrain
 from nemotron.cli.nano3.rl import rl
 from nemotron.cli.nano3.sft import sft
@@ -21,6 +22,9 @@ nano3_app = typer.Typer(
 
 # Register data subgroup
 nano3_app.add_typer(data_app, name="data")
+
+# Register model subgroup
+nano3_app.add_typer(model_app, name="model")
 
 # Register commands
 nano3_app.command(

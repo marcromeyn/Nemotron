@@ -58,7 +58,7 @@ from nemotron.data_prep import (
 logger = logging.getLogger(__name__)
 from nemotron.data_prep.config import DatasetConfig
 from nemotron.data_prep.discovery import get_dataset_metadata
-from nemotron.kit import DataBlendsArtifact, print_step_complete
+from nemotron.kit import SFTDataArtifact, print_step_complete
 from nemotron.kit.trackers import InputDatasetInfo, tokenizer_to_uri
 from nemotron.kit.train_script import (
     apply_hydra_overrides,
@@ -295,7 +295,7 @@ def _concatenate_and_split_npy(
     }
 
 
-def run_data_prep_main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
+def run_data_prep_main(cfg: SFTDataPrepConfig) -> SFTDataArtifact:
     """Run SFT data preparation with chat template.
 
     Processes data through pipeline to generate shards, then concatenates
@@ -305,7 +305,7 @@ def run_data_prep_main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
         cfg: SFT data prep configuration.
 
     Returns:
-        DataBlendsArtifact with paths to packed data.
+        SFTDataArtifact with paths to packed data.
     """
     import shutil
     import time
@@ -410,14 +410,12 @@ def run_data_prep_main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
     tok_uri = tokenizer_to_uri(cfg.tokenizer_model)
 
     # Build output artifact - path points to output_dir (contains training.npy, etc.)
-    artifact = DataBlendsArtifact(
+    artifact = SFTDataArtifact(
         path=cfg.output_dir,
         total_tokens=result.total_tokens,
         total_sequences=split_stats["total_sequences"],
         elapsed_sec=elapsed_sec,
-        train_tokens=None,  # Token counts per split not tracked in new format
-        valid_tokens=None,
-        test_tokens=None,
+        pack_size=cfg.pack_size,
         source_datasets=source_datasets,
         tokenizer_uri=tok_uri,
     )
@@ -431,14 +429,14 @@ def run_data_prep_main(cfg: SFTDataPrepConfig) -> DataBlendsArtifact:
     return artifact
 
 
-def main(cfg: SFTDataPrepConfig | None = None) -> DataBlendsArtifact:
+def main(cfg: SFTDataPrepConfig | None = None) -> SFTDataArtifact:
     """Entry point for SFT data preparation.
 
     Args:
         cfg: Config from CLI framework, or None when run directly as script.
 
     Returns:
-        DataBlendsArtifact with paths to packed data.
+        SFTDataArtifact with paths to packed data.
     """
     if cfg is None:
         # Called directly as script - parse config ourselves

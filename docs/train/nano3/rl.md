@@ -301,7 +301,7 @@ nemotron nano3 rl -c tiny --batch YOUR-CLUSTER
 nemotron nano3 rl -c tiny --run YOUR-CLUSTER --dry-run
 ```
 
-See [nemo-run.md](../nemo-run.md) for complete configuration options.
+See [nemo-run.md](../../nemo-run.md) for complete configuration options.
 
 ## GRPO Algorithm
 
@@ -347,5 +347,5 @@ ModelArtifact-rl (final aligned model)
 
 ## Reference
 
-- [Recipe Source](../../src/nemotron/recipes/nano3/stage2_rl/) - Implementation details
+- [Recipe Source](../../../src/nemotron/recipes/nano3/stage2_rl/) - Implementation details
 - [Back to Overview](./README.md)
